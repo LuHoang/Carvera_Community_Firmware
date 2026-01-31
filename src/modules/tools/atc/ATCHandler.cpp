@@ -1006,11 +1006,17 @@ void ATCHandler::fill_cali_scripts(bool is_probe, bool clear_z) {
 	snprintf(buff, sizeof(buff), "G53 G0 Z%.3f", THEROBOT->from_millimeters(clear_z ? this->clearance_z : this->safe_z_mm));
 	this->script_queue.push(buff);
 	// move x and y to calibrate position
-    if(THEKERNEL->factory_set->FuncSetting & (1<<2))	//ATC 
+    if(THEKERNEL->factory_set->FuncSetting & (1<<2))	//ATC
     {
-		// Use one-off offsets if configured, otherwise use standard probe position
-		float probe_x = probe_mx_mm + (this->probe_oneoff_configured ? this->probe_oneoff_x : 0.0);
-		float probe_y = probe_my_mm + (this->probe_oneoff_configured ? this->probe_oneoff_y : 0.0);
+		float probe_x, probe_y;
+		if(CARVERA_AIR == THEKERNEL->factory_set->MachineModel) {
+			// Carvera Air ATC: use manual position so calibrate stays within soft limits
+			probe_x = anchor1_x + 280 + (this->probe_oneoff_configured ? this->probe_oneoff_x : 0.0);
+			probe_y = anchor1_y + 196 + (this->probe_oneoff_configured ? this->probe_oneoff_y : 0.0);
+		} else {
+			probe_x = probe_mx_mm + (this->probe_oneoff_configured ? this->probe_oneoff_x : 0.0);
+			probe_y = probe_my_mm + (this->probe_oneoff_configured ? this->probe_oneoff_y : 0.0);
+		}
 		snprintf(buff, sizeof(buff), "G53 G0 X%.3f Y%.3f", THEROBOT->from_millimeters(probe_x), THEROBOT->from_millimeters(probe_y));
 	}
 	else	//Manual Tool Change
@@ -1022,10 +1028,15 @@ void ATCHandler::fill_cali_scripts(bool is_probe, bool clear_z) {
 	}
 	this->script_queue.push(buff);
 	// do calibrate with fast speed
-    if(THEKERNEL->factory_set->FuncSetting & (1<<2))	//ATC 
+    if(THEKERNEL->factory_set->FuncSetting & (1<<2))	//ATC
     {
-		// Use one-off Z offset if configured, otherwise use standard probe Z position
-		float probe_z = probe_mz_mm + (this->probe_oneoff_configured ? this->probe_oneoff_z : 0.0);
+		float probe_z;
+		if(CARVERA_AIR == THEKERNEL->factory_set->MachineModel) {
+			// Carvera Air ATC: use manual Z so calibrate stays within soft limits
+			probe_z = toolrack_z - 10 + (this->probe_oneoff_configured ? this->probe_oneoff_z : 0.0);
+		} else {
+			probe_z = probe_mz_mm + (this->probe_oneoff_configured ? this->probe_oneoff_z : 0.0);
+		}
 		snprintf(buff, sizeof(buff), "G38.6 Z%.3f F%.3f", probe_z, probe_fast_rate);
 	}
 	else	//Manual Tool Change
