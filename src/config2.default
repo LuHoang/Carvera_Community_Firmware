@@ -76,7 +76,9 @@ epsilon_dir_pin								1.0				# Pin for delta stepper direction
 epsilon_en_pin								1.10			# Pin for delta enable
 #epsilon_max_rate							100.0			# mm/min
 #epsilon_acceleration						10.0			# mm/secÂ²
-epsilon_steps_per_mm						888.88888		# may be steps per degree for example (26.67)
+#epsilon_steps_per_mm						888.88888		# may be steps per degree for example (26.67)
+epsilon_steps_per_mm						43200			
+
 
 # WIFI
 # wifi.enable									true
@@ -415,10 +417,10 @@ coordinate.toolrack_z -108				# ATC Z axis machine coordinates
 
 # Tool setter (probe) position in absolute Machine Coordinate System
 # If not set, uses hardcoded values: X=-165.0, Y=173.0, Z=-148.0 for CARVERA_AIR
-# Set these values to configure a custom probe position, leave unset to use defaults
-#coordinate.probe_mcs_x -165.0		# Tool setter X position in MCS (mm)
-#coordinate.probe_mcs_y 173.0		# Tool setter Y position in MCS (mm)
-#coordinate.probe_mcs_z -148.0		# Tool setter Z position in MCS (mm)
+# Set to manual calibrate position (anchor1+280, anchor1+196, toolrack_z-10) so ATC calibrate uses same pos as manual mode
+coordinate.probe_mcs_x -11.0			# Tool setter X = anchor1_x+280 (mm)
+coordinate.probe_mcs_y -7.0			# Tool setter Y = anchor1_y+196 (mm)
+coordinate.probe_mcs_z -118.0		# Tool setter Z = toolrack_z-10 (mm)
 
 coordinate.rotation_offset_x 41.5		# Rotation module X Offset relative to anchor1
 coordinate.rotation_offset_y 82.5		# Rotation module Y Offset relative to anchor1
