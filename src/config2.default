@@ -77,7 +77,6 @@ epsilon_en_pin								1.10			# Pin for delta enable
 #epsilon_max_rate							100.0			# mm/min
 #epsilon_acceleration						10.0			# mm/secÂ²
 #epsilon_steps_per_mm						888.88888		# may be steps per degree for example (26.67)
-epsilon_steps_per_mm						43200			
 
 
 # WIFI
@@ -508,14 +507,3 @@ temperature_control.spindle.max_temp		70				# Alarm and halt machine when overhe
 # wireless probe
 wp.min_voltage								3.6			# Wireless probe charge start voltage
 wp.max_voltage								4.1			# Wireless probe charge cut-off voltage
-
-
-# Other settings for future use
-# Custom tool slot positions (reference only - use /sd/custom_tool_slots.txt or M890 to set):
-# Tool 1: X=-9.1 Y=-57.1 Z=-72
-# Tool 2: X=-9.1 Y=-77.1 Z=-72
-# Tool 3: X=-9.1 Y=-97.1 Z=-72
-# Tool 4: X=-9.1 Y=-117.1 Z=-72
-# Tool 5: X=-9.1 Y=-137.1 Z=-72
-# Tool 6: X=-9.1 Y=-157.1 Z=-72
-# Tool 7: X=-9.1 Y=-177.1 Z=-72
