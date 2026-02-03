@@ -820,7 +820,7 @@ void ATCHandler::fill_manual_drop_scripts(int old_tool) {
 	// lift z to safe position with fast speed
 	snprintf(buff, sizeof(buff), "G90 G53 G0 Z%.3f", THEROBOT->from_millimeters(this->clearance_z));
 	this->script_queue.push(buff);
-	//move to clearance
+	//move to clearance (position set in on_config_reload; Carvera Air uses safe manual position there)
 	snprintf(buff, sizeof(buff), "G90 G53 G0 X%.3f Y%.3f", THEROBOT->from_millimeters(probe_mx_mm), THEROBOT->from_millimeters(probe_my_mm));
 	this->script_queue.push(buff);
 
@@ -853,10 +853,10 @@ void ATCHandler::fill_manual_pickup_scripts(int new_tool, bool clear_z, bool aut
 	// lift z to safe position with fast speed
 	snprintf(buff, sizeof(buff), "G90 G53 G0 Z%.3f", THEROBOT->from_millimeters(this->clearance_z));
 	this->script_queue.push(buff);
-	//move to clearance
+	//move to clearance (position set in on_config_reload; Carvera Air uses safe manual position there)
 	snprintf(buff, sizeof(buff), "G90 G53 G0 X%.3f Y%.3f", THEROBOT->from_millimeters(probe_mx_mm), THEROBOT->from_millimeters(probe_my_mm));
 	this->script_queue.push(buff);
-	
+
 	// loose tool
 	this->script_queue.push("M490.2");
 	//print status
@@ -1437,9 +1437,15 @@ void ATCHandler::on_config_reload(void *argument)
 			probe_my_mm = isnan(this->probe_mcs_y) ? (this->anchor1_y + this->toolrack_offset_y + 180) : this->probe_mcs_y;
 			probe_mz_mm = isnan(this->probe_mcs_z) ? (this->toolrack_z - 40) : this->probe_mcs_z;
 		} else {
-			probe_mx_mm = this->anchor1_x + this->toolrack_offset_x;
-			probe_my_mm = this->anchor1_y + this->toolrack_offset_y + 180;
-			probe_mz_mm = this->toolrack_z - 40;
+			if (CARVERA_AIR == THEKERNEL->factory_set->MachineModel) {
+				probe_mx_mm = this->anchor1_x + 280;
+				probe_my_mm = this->anchor1_y + 196;
+				probe_mz_mm = this->toolrack_z - 10;
+			} else {
+				probe_mx_mm = this->anchor1_x + this->toolrack_offset_x;
+				probe_my_mm = this->anchor1_y + this->toolrack_offset_y + 180;
+				probe_mz_mm = this->toolrack_z - 40;
+			}
 		}
 	} else {
 		// Use default tool slot configuration
@@ -1461,9 +1467,15 @@ void ATCHandler::on_config_reload(void *argument)
 				probe_my_mm = isnan(this->probe_mcs_y) ? (this->anchor1_y + this->toolrack_offset_y -5 + 197) : this->probe_mcs_y;
 				probe_mz_mm = isnan(this->probe_mcs_z) ? (this->toolrack_z - 44.5) : this->probe_mcs_z;
 			} else {
-				probe_mx_mm = this->anchor1_x + this->toolrack_offset_x;
-				probe_my_mm = this->anchor1_y + this->toolrack_offset_y -5 + 197;
-				probe_mz_mm = this->toolrack_z - 44.5;
+				if (CARVERA_AIR == THEKERNEL->factory_set->MachineModel) {
+					probe_mx_mm = this->anchor1_x + 280;
+					probe_my_mm = this->anchor1_y + 196;
+					probe_mz_mm = this->toolrack_z - 10;
+				} else {
+					probe_mx_mm = this->anchor1_x + this->toolrack_offset_x;
+					probe_my_mm = this->anchor1_y + this->toolrack_offset_y -5 + 197;
+					probe_mz_mm = this->toolrack_z - 44.5;
+				}
 			}
 		}
 		else
@@ -1484,9 +1496,15 @@ void ATCHandler::on_config_reload(void *argument)
 				probe_my_mm = isnan(this->probe_mcs_y) ? (this->anchor1_y + this->toolrack_offset_y + 180) : this->probe_mcs_y;
 				probe_mz_mm = isnan(this->probe_mcs_z) ? (this->toolrack_z - 40) : this->probe_mcs_z;
 			} else {
-				probe_mx_mm = this->anchor1_x + this->toolrack_offset_x;
-				probe_my_mm = this->anchor1_y + this->toolrack_offset_y + 180;
-				probe_mz_mm = this->toolrack_z - 40;
+				if (CARVERA_AIR == THEKERNEL->factory_set->MachineModel) {
+					probe_mx_mm = this->anchor1_x + 280;
+					probe_my_mm = this->anchor1_y + 196;
+					probe_mz_mm = this->toolrack_z - 10;
+				} else {
+					probe_mx_mm = this->anchor1_x + this->toolrack_offset_x;
+					probe_my_mm = this->anchor1_y + this->toolrack_offset_y + 180;
+					probe_mz_mm = this->toolrack_z - 40;
+				}
 			}
 		}
 	}
