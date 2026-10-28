@@ -8,6 +8,44 @@
 #ifndef PUBLICDATA_H
 #define PUBLICDATA_H
 
+//new communication protocol
+#define HEADER        0x8668
+#define FOOTER        0x55AA
+#define PTYPE_CTRL_SINGLE	0xA1
+#define	PTYPE_CTRL_MULTI	0xA2
+#define PTYPE_FILE_START	0xB0
+#define PTYPE_FILE_MD5		0xB1
+#define PTYPE_FILE_VIEW		0xB2
+#define PTYPE_FILE_DATA		0xB3
+#define PTYPE_FILE_END		0xB4
+#define PTYPE_FILE_CAN		0xB5
+#define PTYPE_FILE_RETRY	0xB6
+#define PTYPE_CONFIG_START	0xD1
+#define PTYPE_CONFIG_VIEW	0xD2
+#define PTYPE_CONFIG_DATA	0xD3
+#define PTYPE_CONFIG_END		0xD4
+#define PTYPE_CONFIG_CAN		0xD5
+#define PTYPE_FACTORY_START	0xE1
+#define PTYPE_FACTORY_VIEW	0xE2
+#define PTYPE_FACTORY_DATA	0xE3
+#define PTYPE_FACTORY_END	0xE4
+#define PTYPE_FACTORY_CAN	0xE5
+#define PTYPE_PLAY_START	0xF1
+#define PTYPE_PLAY_VIEW		0xF2
+#define PTYPE_PLAY_DATA		0xF3
+#define PTYPE_PLAY_END		0xF4
+#define PTYPE_PLAY_CAN		0xF5
+#define PTYPE_GOTO_START	0xF6
+#define PTYPE_GOTO_LINES	0xF7
+#define PTYPE_FIRM_VER		0x71
+#define PTYPE_STATUS_RES	0x81
+#define PTYPE_DIAG_RES		0x82
+#define PTYPE_LOAD_INFO		0x83
+#define PTYPE_LOAD_FINISH	0x84
+#define PTYPE_LOAD_ERROR	0x85
+#define PTYPE_NORMAL_INFO	0x90
+#include <stdint.h>
+
 class PublicData {
     public:
         // there are two ways to get data from a module

@@ -11,9 +11,9 @@
 using namespace std;
 #include <vector>
 #include <stdint.h>
-#include <map>
 
-class ConfigValue;
+#include "ConfigValue.h"
+
 class StreamOutput;
 
 class ConfigCache {
@@ -22,24 +22,33 @@ class ConfigCache {
         ~ConfigCache();
         void clear();
 
-        void add(ConfigValue* v);
         void pop();
 
-        // lookup and return the entru that matches the check sums,return NULL if not found
-        ConfigValue *lookup(const uint16_t *check_sums) const;
+        // lookup and return the entry that matches the check sums, return NULL if not found
+        ConfigValue *lookup(const uint16_t *check_sums);
 
         // collect enabled checksums of the given family
         void collect(uint16_t family, uint16_t cs, vector<uint16_t> *list);
 
-        // If we find an existing value, replace it, otherwise, push it at the back of the list
-        void replace_or_push_back(ConfigValue* new_value);
+        // If we find an existing value, replace it, otherwise copy it to the back
+        ConfigValue *replace_or_push_back(const ConfigValue &new_value);
 
         // used for debugging, dumps the cache to a stream
         void dump(StreamOutput *stream);
 
     private:
-        typedef vector<ConfigValue*> storage_t;
-        storage_t store;
+        static const uint8_t VALUES_PER_CHUNK = 16;
+
+        struct Chunk {
+            Chunk() : next(NULL), used(0) {}
+            ConfigValue values[VALUES_PER_CHUNK];
+            Chunk *next;
+            uint8_t used;
+        };
+
+        Chunk *first;
+        Chunk *last;
+        uint16_t count;
 };
 
 

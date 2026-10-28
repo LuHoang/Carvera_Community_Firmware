@@ -34,6 +34,8 @@ public:
 private:
 
     void jog(string params, StreamOutput *stream);
+    void feed_override(string params, StreamOutput *stream);
+    void spindle_override(string params, StreamOutput *stream);
 
     static void ls_command(string parameters, StreamOutput *stream );
     static void cd_command(string parameters, StreamOutput *stream );
@@ -53,6 +55,8 @@ private:
     static void calc_thermistor_command( string parameters, StreamOutput *stream);
     static void print_thermistors_command( string parameters, StreamOutput *stream);
     static void md5sum_command( string parameters, StreamOutput *stream);
+    static void md5check_command( string parameters, StreamOutput *stream );
+    static void md5check_file_command( string parameters, StreamOutput *stream );
     static void grblDP_command( string parameters, StreamOutput *stream);
 
     static void switch_command(string parameters, StreamOutput *stream );
@@ -91,6 +95,12 @@ private:
     static void enable_4th_hd(string parameters, StreamOutput *stream );
     
     static void disable_4th_hd( string parameters, StreamOutput *stream);
+
+    static void PacketMessage(char cmd, const char* s, int size, StreamOutput *stream);
+
+    static void baud_command(string parameters, StreamOutput *stream);
+
+    static void debugmode_command(string parameters, StreamOutput *stream);
 
     typedef void (*PFUNC)(string parameters, StreamOutput *stream);
     typedef struct {

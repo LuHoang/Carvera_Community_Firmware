@@ -25,6 +25,14 @@ If the path is an existing directory, the artifact will be copied into it as `ma
 If the path points to a non-existent file in an existing directory, the artifact will be copied to that path.
 The destination directory must exist.
 
+.PARAMETER Debug
+Build with MRI debug monitor linked (BUILD_TYPE=Debug). Enables GDB attach
+via serial and __debugbreak() calls. Uses -Og optimization for debugging.
+
+.PARAMETER Slow
+runs the build command single threaded to prevent issues with multiple threads
+writing error messages over eachother
+
 .PARAMETER Help
 Displays this help message and exits.
 
@@ -47,7 +55,7 @@ to be passed to the make command.
 
 .EXAMPLE
 # Build with default GCC and enable debug monitor
-./build/build.ps1 ENABLE_DEBUG_MONITOR=1
+./build/build.ps1 --Debug
 
 .NOTES
 Relies on ./build/gcc.ps1 being present in the same directory.
@@ -70,7 +78,10 @@ param(
     [string]$OutputPath,
 
     [Parameter(Mandatory=$false)]
-    [switch]$Help
+    [switch]$Help,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$Slow
 )
 
 # --- Script Setup ---
@@ -116,9 +127,22 @@ if ($PSVersionTable.PSEdition -eq "Desktop" -or
     $cpuCount = [Environment]::ProcessorCount
     Write-Host "Using $cpuCount parallel jobs for make." -ForegroundColor Cyan
 }
+if ($Slow){
+    $cpuCount = "1"
+}
+# Determine build type
+$buildType = if ($Debug) { "Debug" } else { "Release" }
 
+Write-Host "Build type: $buildType" -ForegroundColor Cyan
 Write-Host "Using GCC version: $requestedGccVersion" -ForegroundColor Cyan
 Write-Host "Using $cpuCount parallel jobs for make." -ForegroundColor Cyan
+$machineFamily = if ([string]::IsNullOrWhiteSpace($env:MACHINE)) { "carvera" } else { $env:MACHINE }
+foreach ($arg in $MakeExtraArgs) {
+    if ($arg -match '^MACHINE=(.+)$') {
+        $machineFamily = $Matches[1]
+    }
+}
+
 if ($Clean) {
     Write-Host "Will run 'make clean' first." -ForegroundColor Cyan
 }
@@ -130,7 +154,7 @@ $exitCode = 0
 
 # --- Run Clean Step (if requested) ---
 if ($Clean) {
-    $cleanCommandArgs = @("make", "clean")
+    $cleanCommandArgs = @("make", "clean", "MACHINE=$machineFamily")
     Write-Host "Running: $($cleanCommandArgs -join ' ') (via gcc.ps1)..." -ForegroundColor Green
     try {
         & $GccScriptPath -GccVersion $requestedGccVersion -CommandToRun $cleanCommandArgs
@@ -151,6 +175,7 @@ $makeArgsList = New-Object System.Collections.Generic.List[string]
 $makeArgsList.Add("make")
 $makeArgsList.Add("-j$cpuCount")
 $makeArgsList.AddRange($BaseMakeArgs.Split(' '))
+$makeArgsList.Add("BUILD_TYPE=$buildType")
 if ($MakeExtraArgs.Length -gt 0) {
     $makeArgsList.AddRange($MakeExtraArgs)
 }
@@ -168,7 +193,8 @@ try {
 
     # --- Handle Output Copy --- 
     if ($exitCode -eq 0 -and $PSBoundParameters.ContainsKey('OutputPath') -and -not [string]::IsNullOrWhiteSpace($OutputPath)) {
-        $sourceFile = Join-Path $ProjectRoot "LPC1768/main.bin"
+        $artifactDir = if ($machineFamily -eq "z1") { "LPC1768-z1" } else { "LPC1768" }
+        $sourceFile = Join-Path $ProjectRoot "$artifactDir/main.bin"
         if (-not (Test-Path $sourceFile -PathType Leaf)) {
             Write-Error "Build artifact not found at $sourceFile"
             exit 1
@@ -213,4 +239,4 @@ try {
 }
 
 # Exit with the final exit code from the build (or clean if build didn't run/succeeded)
-exit $exitCode 
+exit $exitCode

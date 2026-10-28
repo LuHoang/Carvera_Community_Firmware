@@ -103,6 +103,7 @@ public:
     void on_module_loaded();
     void on_gcode_received(void *argument);
     void on_main_loop(void *argument);
+    void on_idle(void *argument);
 
     bool check_last_probe_ok();
     bool run_probe(float& mm, float feedrate, float max_dist= -1, bool reverse= false);
@@ -144,6 +145,7 @@ private:
     void calibrate_probe_bore();
     void calibrate_probe_boss();
     void single_axis_probe_double_tap();
+    void set_wcs_from_probe_result(Gcode *gcode);
     void calibrate_Z(Gcode *gc);
     uint32_t read_probe(uint32_t dummy);
     uint32_t read_calibrate(uint32_t dummy);
@@ -184,6 +186,7 @@ private:
     volatile bool calibrate_detected;
     volatile bool probe_triggered;
     volatile bool halt_pending;
+    volatile uint32_t probe_crash_count;
 
     PROBING_CYCLES probing_cycle;
 
@@ -206,6 +209,7 @@ private:
     volatile float calibrate_pin_position;  
     // zprobe.calibrate_safety_margin
     float probe_calibration_safety_margin;
+    bool require_probe_trigger_for_calibration = true;
     // Z position when probe pin triggered        
     volatile float probe_pin_position;
     volatile float calibrate_current_z;

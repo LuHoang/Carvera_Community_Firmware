@@ -12,6 +12,7 @@
 #define THECONVEYOR THEKERNEL->conveyor
 #define THEROBOT THEKERNEL->robot
 
+#include "FactorySettings.h"
 #include "Module.h"
 #include "I2C.h" // mbed.h lib
 #include <array>
@@ -22,8 +23,6 @@
 
 // 9 WCS offsets
 #define MAX_WCS 9UL
-#define CARVERA		1
-#define CARVERA_AIR	2
 //Module manager
 class Config;
 class Module;
@@ -39,6 +38,9 @@ class Adc;
 class PublicData;
 class SimpleShell;
 class Configurator;
+struct SerialMessage;
+class BedCleaning;
+class SpindleAccessories;
 
 enum STATE {
 	IDLE    = 0,
@@ -101,18 +103,11 @@ typedef struct {
 	float reserve;
 	int TOOL;
     float perm_vars[20];
-    bool probe_tool_not_calibrated;
+    bool tool_not_calibrated;
     int current_wcs;
     float WCScoord[6][4];
     float WCSrotation[6];
 } EEPROM_data;
-
-typedef struct {
-	char  MachineModel;
-	char  FuncSetting;
-	char  reserve1;
-	char  reserve2;
-} FACTORY_SET;
 
 class Kernel {
     public:
@@ -130,6 +125,8 @@ class Kernel {
         void add_module(Module* module);
         void register_for_event(_EVENT_ENUM id_event, Module *module);
         void call_event(_EVENT_ENUM id_event, void * argument= nullptr);
+        bool dispatch_console_line(SerialMessage& message);
+        bool is_dispatching_console_line() const { return dispatching_console_line; }
 
         bool kernel_has_event(_EVENT_ENUM id_event, Module *module);
         void unregister_for_event(_EVENT_ENUM id_event, Module *module);
@@ -165,14 +162,11 @@ class Kernel {
         void set_laser_mode(bool f) { laser_mode = f; }
         bool get_laser_mode() const { return laser_mode; }
 
-        void set_vacuum_mode(bool f) { vacuum_mode = f; }
-        bool get_vacuum_mode() const { return vacuum_mode; }
-
         void set_optional_stop_mode(bool f) { optional_stop_mode = f; }
         bool get_optional_stop_mode() const { return optional_stop_mode; }
         void set_line_by_line_exec_mode(bool f) { line_by_line_exec_mode = f; }
         bool get_line_by_line_exec_mode() const { return line_by_line_exec_mode; }
-
+        
         void set_sleeping(bool f) { sleeping = f; }
         bool is_sleeping() const { return sleeping; }
 
@@ -182,7 +176,7 @@ class Kernel {
         void set_waiting(bool f) { waiting = f; }
         bool is_waiting() const { return waiting; }
         
-        void set_tool_waiting(bool f) { tool_waiting = f; }
+        void set_tool_waiting(bool f);
         bool is_tool_waiting() const { return tool_waiting; }
 
         void set_aborted(bool f) { aborted = f; }
@@ -193,8 +187,10 @@ class Kernel {
 
         void set_flex_compensation_active(bool f) { flex_compensation_active = f; }
         bool is_flex_compensation_active() const { return flex_compensation_active; }
-        void set_flex_compensation_load_error(bool f) { flex_compensation_load_error = f; }
-        bool is_flex_compensation_load_error() const { return flex_compensation_load_error; }
+        void set_flex_compensation_load_error(float f) { flex_compensation_load_error = f; }
+        float is_flex_compensation_load_error() const { return flex_compensation_load_error; }
+        void set_config_load_error(bool f) { config_load_error = f; }
+        bool is_config_load_error() const { return config_load_error; }
 
         void set_probeLaser(bool f) { probeLaserOn = f; }
         bool is_probeLaserOn() const { return probeLaserOn; }
@@ -202,6 +198,9 @@ class Kernel {
         void set_halt_reason(uint8_t reason) { halt_reason = reason; }
         uint8_t get_halt_reason() const { return halt_reason; }
         void set_halted(bool h) { halted = h; }
+
+        void on_steppers_powered(bool powered, uint32_t now_us);
+        bool stepper_alarms_enabled(uint32_t now_us, uint32_t settle_us) const;
 
         void set_atc_state(uint8_t state) { atc_state = state; }
         uint8_t get_atc_state() const { return atc_state; }        
@@ -213,16 +212,14 @@ class Kernel {
         void write_eeprom_data();
         void erase_eeprom_data();
         void check_eeprom_data();
+        void dump_eeprom(StreamOutput *stream);
         
         void read_Factory_data();
-        void write_Factory_data();
+        bool write_Factory_data();
         void erase_Factory_data();
         void read_Factroy_SD();
         bool Check_Factory_Data(unsigned char *data, unsigned int len);
         bool Factroy_readLine(std::string& line, int lineno, FILE *fp);
-        bool process_line(const std::string &buffer, uint16_t *check_sum, unsigned char *value);
-        unsigned int crc16_ccitt(unsigned char *data, unsigned int len);
-
         std::string get_query_string();
 
         std::string get_diagnose_string();
@@ -237,6 +234,8 @@ class Kernel {
         Conveyor*         conveyor;
         Configurator*     configurator;
         SimpleShell*      simpleshell;
+        BedCleaning* bed_cleaning;
+        SpindleAccessories* spindle_accessories;
 
         SlowTicker*       slow_ticker;
         StepTicker*       step_ticker;
@@ -255,16 +254,27 @@ class Kernel {
         uint16_t probe_addr;
         bool checkled;
         bool spindleon;
-        float local_vars[20];
-        float probe_outputs[6];
-        float probe_tip_diameter = 1.6;
+        bool axis_is_on[6];
+
+        struct {
+            bool slowticker_profiling:1;
+            bool cpu_load:1;
+        } debug_flags;
+        float  probe_outputs[6];
+        float  probe_tip_diameter = 1.6;
         bool disable_endstops = false;
+
+        float* local_params;      // #1–#30: subroutine call parameters
+        float* local_vars;        // #101–#120: user defined variables
 
     private:
         // When a module asks to be called for a specific event ( a hook ), this is where that request is remembered
         mbed::I2C* i2c;
         std::array<std::vector<Module*>, NUMBER_OF_DEFINED_EVENTS> hooks;
         uint32_t stop_request_time;
+        uint32_t steppers_powered_at_us;
+        void protocol_from_name(const std::string& name, ProtocolMode& protocol);
+        uint8_t flex_compensation_load_error;
         struct {
             bool use_leds:1;
             bool halted:1;
@@ -278,7 +288,6 @@ class Kernel {
             bool keep_alive_request:1;
             volatile bool uploading:1;
             bool laser_mode:1;
-            bool vacuum_mode:1;
             bool optional_stop_mode:1;
             bool line_by_line_exec_mode:1;
             bool sleeping:1;
@@ -292,10 +301,11 @@ class Kernel {
             bool disable_serial_console:1;
             bool halt_on_error_debug:1;
             bool flex_compensation_active:1;
-            bool flex_compensation_load_error:1;
+            bool config_load_error:1;
+            bool dispatching_console_line:1;
+            bool steppers_powered:1;
         };
         int iic_page_write(unsigned char u8PageNum, unsigned char u8len, unsigned char *pu8Array);
-
 };
 
 #endif

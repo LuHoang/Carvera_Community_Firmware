@@ -42,16 +42,22 @@ class Endstops : public Module{
         void set_homing_offset(Gcode* gcode);
         uint32_t read_endstops(uint32_t dummy);
         void handle_park_g28();
+        bool slow_approach_axis(int axis_index, float feed_rate_mm_s, float &result_mm, float approach_retract_multiplier = 2.0F);
+        void ensure_z_clearance_for_xy_test();
+        void test_endstop_repeatability(Gcode* gcode);
 
         // global settings
         float g28_position[3]{0}; // save G28 (in grbl mode)
         uint32_t debounce_count;
         uint32_t  debounce_ms;
         axis_bitmap_t axis_to_home;
+        float rotary_clearance_y_min;
+        uint32_t stepper_alarm_settle_us;
 
         float trim_mm[3];
 
         Pin cover_endstop_pin;
+        Pin cover_endstop2_pin;
 
         // per endstop settings
         using endstop_info_t = struct {

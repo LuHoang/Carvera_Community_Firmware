@@ -39,6 +39,68 @@ of adding a new toolchain, that is the right place to do it.
 
 # Compiling the firmware
 
+Make and CMake are both supported. They use the same ARM GCC download helpers,
+but keep their build products separate.
+
+## CMake
+
+CMake 3.20 or newer is required. The convenience scripts prefer Ninja and fall
+back to Make when Ninja is not installed:
+
+```bash
+# Unix
+./build/build-cmake.sh
+
+# Windows
+.\build\build-cmake.ps1
+```
+
+Add `--clean` on Unix or `-Clean` on Windows for a clean build. Use `--debug`
+or `-Debug` to link the MRI debug monitor; Release is the default. GCC 14.2 is
+used by default and another supported toolchain can be selected with
+`--gcc 4.8` or `-GccVersion 4.8`.
+
+The scripts accept Make-style variables as trailing arguments:
+
+```bash
+./build/build-cmake.sh --clean VERSION=my-build AXIS=5 PAXIS=3 CNC=1
+./build/build-cmake.sh --clean MACHINE=z1 VERSION=2.3.0c-my-build
+.\build\build-cmake.ps1 -Clean VERSION=my-build AXIS=5 PAXIS=3 CNC=1
+.\build\build-cmake.ps1 -Clean MACHINE=z1 VERSION=2.3.0c-my-build
+```
+
+The Carvera and Carvera Air output is located at:
+
+```text
+build/cmake/gcc-14.2/carvera/Release/LPC1768/firmware.bin
+```
+
+The Z1 and Z1 Pro output is located at:
+
+```text
+build/cmake/gcc-14.2/z1/Release/LPC1768-z1/firmware.bin
+```
+
+CMake builds fail when `firmware.bin` exceeds the LPC1768's 507,904-byte
+application region (512 KiB flash minus the 16 KiB bootloader).
+
+### CLion
+
+Download the GCC toolchain once before opening the project
+(or simply run the build script):
+
+```bash
+# Unix
+./build/gcc.sh --gcc 14.2 --env >/dev/null
+
+# Windows PowerShell
+.\build\gcc.ps1 -GccVersion 14.2 -Env | Out-Null
+```
+
+Then open the project in CLion and enable the CMake presets (`Firmware Release`
+and `Firmware Debug`).
+
+## Make
 
 Simply run:
 
@@ -62,9 +124,11 @@ The remaining arguments are passed verbatim to the make invocation. Meaning one 
 ```bash
 # Unix
 ./build/build.sh --clean VERBOSE=1
+./build/build.sh --clean MACHINE=z1
 
 # Windows
 .\build\build.ps1 -Clean VERBOSE=1
+.\build\build.ps1 -Clean MACHINE=z1
 ```
 
 A useful flag is `VERSION=string`. This sets the version string as reported by
@@ -78,17 +142,40 @@ if you lose track of what you're running, for instance:
 
 ... will timestamp the version string in your firmware.
 
+The default build produces firmware for Carvera and Carvera Air. Setting
+`MACHINE=z1` produces one firmware image for Z1 and Z1 Pro; the machine model
+is selected from its factory settings at runtime.
+
+To produce a complete Z1 update bundle, set `Z1_REPACK` to an official Makera
+Z1 firmware bundle and set a version that fits the Makera bundle format:
+
+```bash
+./build/build.sh --clean MACHINE=z1 VERSION=2.3.0c-my-build \
+    Z1_REPACK=/path/to/official-z1-firmware.bin
+```
+
+The build retains the ESP firmware from the official bundle, replaces its LPC
+firmware, updates the LPC version and checksums, and writes the resulting
+`firmware-v*.bin` beside `LPC1768-z1/main.bin`.
+
 Additional guides related to building Smoothieware [can be found
 here](https://smoothieware.github.io/Webif-pack/documentation/web/html/compiling-smoothie.html).
 
 # Flashing the firmware
 
-The build process will output `LPC1768/main.bin`. It should be approximately
-500KB in size. There are several strategies to load this onto the machine.
+The Make build outputs `LPC1768/main.bin` for Carvera and Carvera Air, or
+`LPC1768-z1/main.bin` for Z1 and Z1 Pro. The CMake build outputs a
+`firmware.bin` under its selected build tree.
+
+The direct LPC firmware installation methods below apply to Carvera and
+Carvera Air. For Z1 and Z1 Pro, build a complete bundle with `Z1_REPACK` and
+install that file through the normal Z1 firmware update process. The bare
+`LPC1768-z1/main.bin` image is intended for SWD programming and development.
 
 ## Carvera Controller
 
-0. Copy `LP1768/main.bin` to `firmware.bin`
+0. For Make builds, copy `LPC1768/main.bin` to `firmware.bin`. CMake builds are
+   already named `firmware.bin`.
 1. Connect to the machine (note: USB will be quite slow)
 2. Select the hamburger menu (top right)
 3. Choose update (up arrow)
@@ -288,28 +375,6 @@ Just `ctrl-c` GDB to have it break the connection, since it will need to be
 restarted. Re-run `target remote <port>`, or drop out and open the debugger
 again.
 
-### `enable-pool-trace`
-
-This command adds breakpoints to predefined symbols inside alloc and dealloc
-functions in [src/libs/MemoryPool.cpp](src/libs/MemoryPool.cpp). MemoryPool is a
-single contiguous area allocator that manages most of the SRAM region. SRAM is
-limited to 32K and is the lowest latency memory available on the LP1768. 
-
-Most modules are placed in dynamically allocated chunks in this region, while a
-handful of others (SD filesystem related) are statically placed there at compile
-time. Certain modules will continue to make calls to MemoryPool during their
-runtime.
-
-This GDB command is primarily useful with `ENABLE_DEBUG_MONITOR=1` because most
-activity happens during kernel and module initialization, and by capturing these
-logs from firmware boot it's possible to have a complete picture in the case of
-a post-initialization crash.
-
-After running this command, execute `continue`. Both alloc and dealloc
-breakpoints will output the pointer in question as well as its size. A backtrace
-is also logged to identify call sites. This should be enough data to catch
-pointer reuse, over-frees, pool exhaustion, and so on.
-
 ### `smoothie-full-dump` and `smoothie-mini-dump`
 
 Borrowed from [Smoothieware](http://smoothieware.org/mri-debugging) these
@@ -377,22 +442,10 @@ for you and function similarly.
 # alias commands
 alias -a binit = "break main.cpp:init"
 
-# define a command
-define dumpmem
-  echo --- Memory Pool Dump ---\n
-  p _AHB0
-  p _AHB1
-end
-
-# run a command every time you run 'next'
-define hook-next
-    dumpmem
-end
-
 # run commands when a breakpoint is hit
-break MemoryPool::alloc if nbytes >= 5000
+break pvPortMalloc if xWantedSize >= 5000
 commands
-  printf "--- Large AHB Pool Allocation (%lu bytes) ---\n", nbytes
+  printf "--- Large Heap Allocation (%lu bytes) ---\n", xWantedSize
   printf "Call Stack:\n"
   bt
   printf "--------------------------------------------\n"
@@ -504,3 +557,10 @@ python3 $(which scan-view) .analyzer/*
 ```
 
 
+## Updating Makera Code potential issues
+
+The way config files are handled has changed, losing the ->by_default
+So to read a bool config value you would use: 
+this->config->value( disable_leds_checksum )->as_bool(false);
+instead of
+this->config->value( disable_leds_checksum )->by_default(false)->as_bool();

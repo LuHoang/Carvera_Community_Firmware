@@ -30,9 +30,11 @@
 #include "us_ticker_api.h"
 #include "ATCHandlerPublicAccess.h"
 // strategies we know about
+#ifndef CARTGRID_ONLY
 #include "DeltaCalibrationStrategy.h"
 #include "ThreePointStrategy.h"
 #include "DeltaGridStrategy.h"
+#endif
 #include "CartGridStrategy.h"
 
 #include <vector>
@@ -47,6 +49,7 @@
 #define probe_height_checksum    CHECKSUM("probe_height")
 #define probe_tip_diameter_checksum CHECKSUM("probe_tip_diameter")
 #define probe_calibration_safety_margin_checksum CHECKSUM("calibration_safety_margin")
+#define require_probe_trigger_for_calibration_checksum CHECKSUM("require_probe_trigger_for_calibration")
 #define toolZeroIs3Axis_checksum  CHECKSUM("tool_zero_is_3axis")
 #define gamma_max_checksum       CHECKSUM("gamma_max")
 #define max_z_checksum           CHECKSUM("max_z")
@@ -79,7 +82,7 @@ constexpr double pi = 3.141592653589793;
 void ZProbe::on_module_loaded()
 {
     // if the module is disabled -> do nothing
-    if(!THEKERNEL->config->value( zprobe_checksum, enable_checksum )->by_default(true)->as_bool()) {
+    if(!THEKERNEL->config->value( zprobe_checksum, enable_checksum )->as_bool(true)) {
         // as this module is not needed free up the resource
         delete this;
         return;
@@ -92,6 +95,7 @@ void ZProbe::on_module_loaded()
     register_for_event(ON_GET_PUBLIC_DATA);
     register_for_event(ON_SET_PUBLIC_DATA);
     register_for_event(ON_MAIN_LOOP);
+    register_for_event(ON_IDLE);
 
     this->probing_cycle = NONE;
 
@@ -101,7 +105,7 @@ void ZProbe::on_module_loaded()
     tlo_calibrating = false;
     THEKERNEL->slow_ticker->attach(1000, this, &ZProbe::read_probe);
     THEKERNEL->slow_ticker->attach(1000, this, &ZProbe::read_calibrate);
-	if(!(THEKERNEL->factory_set->FuncSetting & (1<<2)))	//Manual Tool change 
+	if(CARVERA_AIR == THEKERNEL->factory_set->MachineModel)	//Manual Tool change 
 	{
     	THEKERNEL->slow_ticker->attach(100, this, &ZProbe::probe_doubleHit);
     }
@@ -110,12 +114,15 @@ void ZProbe::on_module_loaded()
 
 void ZProbe::config_load()
 {
-    this->pin.from_string( THEKERNEL->config->value(zprobe_checksum, probe_pin_checksum)->by_default("2.6v" )->as_string())->as_input();
-    this->calibrate_pin.from_string( THEKERNEL->config->value(zprobe_checksum, calibrate_pin_checksum)->by_default("0.5^" )->as_string())->as_input();
-    this->debounce_ms    = THEKERNEL->config->value(zprobe_checksum, debounce_ms_checksum)->by_default(0  )->as_number();
-    this->probe_calibration_safety_margin = THEKERNEL->config->value(zprobe_checksum, probe_calibration_safety_margin_checksum)->by_default(0.1F)->as_number();
+    this->pin.from_string( THEKERNEL->config->value(zprobe_checksum, probe_pin_checksum)->as_string("2.6v" ))->as_input();
+    this->calibrate_pin.from_string( THEKERNEL->config->value(zprobe_checksum, calibrate_pin_checksum)->as_string("0.5^" ))->as_input();
+    this->debounce_ms    = THEKERNEL->config->value(zprobe_checksum, debounce_ms_checksum)->as_number(0  );
+    this->probe_calibration_safety_margin = THEKERNEL->config->value(zprobe_checksum, probe_calibration_safety_margin_checksum)->as_number(0.1F);
+    this->require_probe_trigger_for_calibration = THEKERNEL->config->value(
+        zprobe_checksum, require_probe_trigger_for_calibration_checksum)->as_bool(true);
     this->halt_pending = false;
     this->probe_triggered = false;
+    this->probe_crash_count = 0;
 
     // get strategies to load
     vector<uint16_t> modules;
@@ -127,6 +134,7 @@ void ZProbe::config_load()
 
             // check with each known strategy and load it if it matches
             switch(cs) {
+#ifndef CARTGRID_ONLY
                 case delta_calibration_strategy_checksum:
                     ls= new DeltaCalibrationStrategy(this);
                     found= true;
@@ -142,7 +150,7 @@ void ZProbe::config_load()
                     ls= new DeltaGridStrategy(this);
                     found= true;
                     break;
-
+#endif
                 case cart_grid_leveling_strategy_checksum:
                     ls= new CartGridStrategy(this);
                     found= true;
@@ -159,44 +167,45 @@ void ZProbe::config_load()
     }
 
     // need to know if we need to use delta kinematics for homing
-    this->is_delta = THEKERNEL->config->value(delta_homing_checksum)->by_default(false)->as_bool();
-    this->is_rdelta = THEKERNEL->config->value(rdelta_homing_checksum)->by_default(false)->as_bool();
+    this->is_delta = THEKERNEL->config->value(delta_homing_checksum)->as_bool(false);
+    this->is_rdelta = THEKERNEL->config->value(rdelta_homing_checksum)->as_bool(false);
 
     // default for backwards compatibility add DeltaCalibrationStrategy if a delta
     // may be deprecated
+#ifndef CARTGRID_ONLY
     if(this->strategies.empty()) {
         if(this->is_delta) {
             this->strategies.push_back(new DeltaCalibrationStrategy(this));
             this->strategies.back()->handleConfig();
         }
     }
+#endif
 
-    this->probe_height  = THEKERNEL->config->value(zprobe_checksum, probe_height_checksum)->by_default(5)->as_number();
-    this->slow_feedrate = THEKERNEL->config->value(zprobe_checksum, slow_feedrate_checksum)->by_default(5)->as_number(); // feedrate in mm/sec
-    this->fast_feedrate = THEKERNEL->config->value(zprobe_checksum, fast_feedrate_checksum)->by_default(100)->as_number(); // feedrate in mm/sec
-    this->return_feedrate = THEKERNEL->config->value(zprobe_checksum, return_feedrate_checksum)->by_default(5)->as_number(); // feedrate in mm/sec
-    this->reverse_z     = THEKERNEL->config->value(zprobe_checksum, reverse_z_direction_checksum)->by_default(false)->as_bool(); // Z probe moves in reverse direction
-    this->max_z         = THEKERNEL->config->value(zprobe_checksum, max_z_checksum)->by_default(NAN)->as_number(); // maximum zprobe distance
-    THEKERNEL->probe_tip_diameter = THEKERNEL->config->value(zprobe_checksum, probe_tip_diameter_checksum)->by_default(2)->as_number(); // probe tip diameter
-    this->tool_0_3axis  = THEKERNEL->config->value(zprobe_checksum, toolZeroIs3Axis_checksum)->by_default(false)->as_bool();
+    this->probe_height  = THEKERNEL->config->value(zprobe_checksum, probe_height_checksum)->as_number(5);
+    this->slow_feedrate = THEKERNEL->config->value(zprobe_checksum, slow_feedrate_checksum)->as_number(5); // feedrate in mm/sec
+    this->fast_feedrate = THEKERNEL->config->value(zprobe_checksum, fast_feedrate_checksum)->as_number(100); // feedrate in mm/sec
+    this->return_feedrate = THEKERNEL->config->value(zprobe_checksum, return_feedrate_checksum)->as_number(5); // feedrate in mm/sec
+    this->reverse_z     = THEKERNEL->config->value(zprobe_checksum, reverse_z_direction_checksum)->as_bool(false); // Z probe moves in reverse direction
+    this->max_z         = THEKERNEL->config->value(zprobe_checksum, max_z_checksum)->as_number(NAN); // maximum zprobe distance
+    THEKERNEL->probe_tip_diameter = THEKERNEL->config->value(zprobe_checksum, probe_tip_diameter_checksum)->as_number(2); // probe tip diameter
+    this->tool_0_3axis  = THEKERNEL->config->value(zprobe_checksum, toolZeroIs3Axis_checksum)->as_bool(false);
     if(isnan(this->max_z)){
-        this->max_z = THEKERNEL->config->value(gamma_max_checksum)->by_default(200)->as_number(); // maximum zprobe distance
+        this->max_z = THEKERNEL->config->value(gamma_max_checksum)->as_number(200); // maximum zprobe distance
     }
-    this->dwell_before_probing = THEKERNEL->config->value(zprobe_checksum, dwell_before_probing_checksum)->by_default(0)->as_number(); // dwell time in seconds before probing
+    this->dwell_before_probing = THEKERNEL->config->value(zprobe_checksum, dwell_before_probing_checksum)->as_number(0); // dwell time in seconds before probing
 
 }
 
 void ZProbe::on_main_loop(void *argument)
 {
-    // Handle deferred halt event from crash detection
-    if (halt_pending) {
-        halt_pending = false;
-        THEKERNEL->call_event(ON_HALT, nullptr);
-    }
+    bool keep_3d_probe_powered = CARVERA_AIR == THEKERNEL->factory_set->MachineModel;
+#if defined(MACHINE_FAMILY_Z1)
+    keep_3d_probe_powered = true;
+#endif
 
     if (check_probe_tool() == 2){
         is_3dprobe_active = true;
-        if (CARVERA_AIR == THEKERNEL->factory_set->MachineModel) {
+        if (keep_3d_probe_powered) {
             bool ignore_on_halt = true;
             PublicData::set_value( switch_checksum, detector_switch_checksum, ignore_on_halt_checksum, &ignore_on_halt );
             bool on = true;
@@ -208,13 +217,18 @@ void ZProbe::on_main_loop(void *argument)
             PublicData::set_value( switch_checksum, detector_switch_checksum, state_checksum, &off );
         }
         is_3dprobe_active = false;    
-        if (CARVERA_AIR == THEKERNEL->factory_set->MachineModel) {
+        if (keep_3d_probe_powered) {
             bool ignore_on_halt = false;
             PublicData::set_value( switch_checksum, detector_switch_checksum, ignore_on_halt_checksum, &ignore_on_halt );
         }
     }
     
     
+    // results of the previous probing cycle (#151-#156) are not valid for the next one
+    if (probing_cycle != NONE) {
+        for (int i = 0; i < 6; ++i) THEKERNEL->probe_outputs[i] = -1.0e6f;
+    }
+
     switch(probing_cycle)
     {
         case CALIBRATE_PROBE_BORE:
@@ -266,6 +280,18 @@ void ZProbe::on_main_loop(void *argument)
     }
 }
 
+// Finishes a crash halt that read_probe started. ON_IDLE also runs while the main loop waits for the
+// queue to empty (M400, macros, tool change), where ON_MAIN_LOOP would never come, so the halt
+// flushes the queue there as well.
+void ZProbe::on_idle(void *argument)
+{
+    if (!halt_pending) return;
+    halt_pending = false;
+    THEKERNEL->streams->printf("error:3D Probe crash detected\r\n");
+    THEKERNEL->streams->printf("Manually move the probe to a safe position\r\n");
+    THEKERNEL->call_event(ON_HALT, nullptr);
+}
+
 uint32_t ZProbe::read_probe(uint32_t dummy)
 {
 
@@ -276,16 +302,15 @@ uint32_t ZProbe::read_probe(uint32_t dummy)
     if(STEPPER[X_AXIS]->is_moving() || STEPPER[Y_AXIS]->is_moving() || STEPPER[Z_AXIS]->is_moving()) {
         if (this->pin.get() != invert_probe && is_3dprobe_active && !probe_triggered) {
             probe_triggered = true;
-            // Set halt state immediately for fast response, defer event processing to main loop
+            // Set halt state immediately for fast response, defer the messages and the halt event to on_idle:
+            // printing from this interrupt can block on the WiFi stream and the watchdog then resets
             // Disable crash detection during TLO calibration to prevent false positives
             if (!probing && !calibrating && !tlo_calibrating) {
                 THEKERNEL->set_halt_reason(CRASH_DETECTED);
                 THEKERNEL->set_halted(true);
-                // Set a flag to process the halt event in the main loop
                 halt_pending = true;
-                THEKERNEL->streams->printf("error:3D Probe crash detected\r\n");
-                THEKERNEL->streams->printf("Manually move the probe to a safe position\r\n");
-            } 
+                ++probe_crash_count;
+            }
         }
     }
 
@@ -341,9 +366,8 @@ uint32_t ZProbe::read_calibrate(uint32_t dummy)
 
             if (!probing || probe_detected) {
                 // if we are not probing, e.g. doing a regular TLO calibration,
-                // or we are probing and the probe was detected we signal the
-                // motors to stop, which will preempt any moves on that axis we
-                // do all motors as it may be a delta
+                // or the configured trigger condition is met, stop all motors
+                // as it may be a delta.
                 for (auto &a : THEROBOT->actuators) a->stop_moving();
                 cali_debounce = 0;
             } else {
@@ -507,7 +531,7 @@ void ZProbe::on_gcode_received(void *argument)
 {
     Gcode *gcode = static_cast<Gcode *>(argument);
 
-    if( gcode->has_g && gcode->g >= 29 && gcode->g <= 33) {
+    if( gcode->has_g && gcode->g >= 29 && gcode->g <= 34) {
 
         invert_probe = false;
         // make sure the probe is defined and not already triggered before moving motors
@@ -622,14 +646,14 @@ void ZProbe::on_gcode_received(void *argument)
                     parse_parameters(gcode);
                 } else if (gcode->subcode == 2){//calibrate using boss
                     if (!gcode->has_letter('X') && !gcode->has_letter('Y')){ //error if there is a problem
-                        gcode->stream->printf("ALARM: Probe fail: No Gague Length\n");
+                        gcode->stream->printf("ERROR: Probe fail: No Gague Length\n");
                         THEKERNEL->call_event(ON_HALT, nullptr);
                         THEKERNEL->set_halt_reason(PROBE_FAIL);
                         return;
                     }
                 
                     if (gcode->has_letter('X') && gcode->has_letter('Y')){
-                        gcode->stream->printf("ALARM: Probe fail: Multiple Axes Given When 1 Expected\n");
+                        gcode->stream->printf("ERROR: Probe fail: Multiple Axes Given When 1 Expected\n");
                         THEKERNEL->call_event(ON_HALT, nullptr);
                         THEKERNEL->set_halt_reason(PROBE_FAIL);
                         return;
@@ -639,7 +663,7 @@ void ZProbe::on_gcode_received(void *argument)
                     }
                 }else {
                     if (!gcode->has_letter('X') && !gcode->has_letter('Y') ) { //error if there is a problem
-                        gcode->stream->printf("ALARM: Probe fail: No Radius Given\n");
+                        gcode->stream->printf("ERROR: Probe fail: No Radius Given\n");
                         THEKERNEL->call_event(ON_HALT, nullptr);
                         THEKERNEL->set_halt_reason(PROBE_FAIL);
                         return;
@@ -652,7 +676,7 @@ void ZProbe::on_gcode_received(void *argument)
                 break;
             case 461:
                 if (!gcode->has_letter('X') && !gcode->has_letter('Y')){ //error if there is a problem
-                    gcode->stream->printf("ALARM: Probe fail: No Axis Set\n");
+                    gcode->stream->printf("ERROR: Probe fail: No Axis Set\n");
                     THEKERNEL->call_event(ON_HALT, nullptr);
                     THEKERNEL->set_halt_reason(PROBE_FAIL);
                     return;
@@ -663,7 +687,7 @@ void ZProbe::on_gcode_received(void *argument)
                 break;
             case 462:
                 if (!gcode->has_letter('X') && !gcode->has_letter('Y')){ //error if there is a problem
-                    gcode->stream->printf("ALARM: Probe fail: No Axis Set\n");
+                    gcode->stream->printf("ERROR: Probe fail: No Axis Set\n");
                     THEKERNEL->call_event(ON_HALT, nullptr);
                     THEKERNEL->set_halt_reason(PROBE_FAIL);
                     return;
@@ -674,7 +698,7 @@ void ZProbe::on_gcode_received(void *argument)
                 break;
             case 463:
                 if (!gcode->has_letter('X') || !gcode->has_letter('Y')){
-                    gcode->stream->printf("ALARM: Probe fail: Both X and Y axis need to be set for Corner Probing\n");
+                    gcode->stream->printf("ERROR: Probe fail: Both X and Y axis need to be set for Corner Probing\n");
                     THEKERNEL->call_event(ON_HALT, nullptr);
                     THEKERNEL->set_halt_reason(PROBE_FAIL);
                     return;
@@ -685,7 +709,7 @@ void ZProbe::on_gcode_received(void *argument)
                 break;
             case 464:
                 if (!gcode->has_letter('X') || !gcode->has_letter('Y')){
-                    gcode->stream->printf("ALARM: Probe fail: Both X and Y axis need to be set for Corner Probing\n");
+                    gcode->stream->printf("ERROR: Probe fail: Both X and Y axis need to be set for Corner Probing\n");
                     THEKERNEL->call_event(ON_HALT, nullptr);
                     THEKERNEL->set_halt_reason(PROBE_FAIL);
                     return;
@@ -695,10 +719,10 @@ void ZProbe::on_gcode_received(void *argument)
                 }
                 break;
             case 465:
-                parse_parameters(gcode, true);
+                if (!parse_parameters(gcode, true)) return;
                 if (gcode->subcode == 1){
                     if (!gcode->has_letter('Y') || !gcode->has_letter('H')){
-                        gcode->stream->printf("ALARM: Probe fail: No distance or height set\n");
+                        gcode->stream->printf("ERROR: Probe fail: No distance or height set\n");
                         THEKERNEL->call_event(ON_HALT, nullptr);
                         THEKERNEL->set_halt_reason(PROBE_FAIL);
                         return;
@@ -706,7 +730,7 @@ void ZProbe::on_gcode_received(void *argument)
                     probing_cycle = PROBE_A_AXIS;
                 }else if (gcode->subcode == 2){
                     if (!gcode->has_letter('X') || !gcode->has_letter('Y') || !gcode->has_letter('R')){
-                        gcode->stream->printf("ALARM: Probe fail: No offset, distance or height set\n");
+                        gcode->stream->printf("ERROR: Probe fail: No offset, distance or height set\n");
                         THEKERNEL->call_event(ON_HALT, nullptr);
                         THEKERNEL->set_halt_reason(PROBE_FAIL);
                         return;
@@ -714,13 +738,13 @@ void ZProbe::on_gcode_received(void *argument)
                     probing_cycle = PROBE_A_AXIS_WITH_OFFSET;
                 }else{
                     if (!gcode->has_letter('X') && !gcode->has_letter('Y')){
-                            gcode->stream->printf("ALARM: Probe fail: No axis set\n");
+                            gcode->stream->printf("ERROR: Probe fail: No axis set\n");
                         THEKERNEL->call_event(ON_HALT, nullptr);
                         THEKERNEL->set_halt_reason(PROBE_FAIL);
                         return;
                     }
                     if (gcode->has_letter('X') && gcode->has_letter('Y')){
-                        gcode->stream->printf("ALARM: Probe fail: Axis probing only supports 1 axis input\n");
+                        gcode->stream->printf("ERROR: Probe fail: Axis probing only supports 1 axis input\n");
                         THEKERNEL->call_event(ON_HALT, nullptr);
                         THEKERNEL->set_halt_reason(PROBE_FAIL);
                         return;
@@ -731,7 +755,7 @@ void ZProbe::on_gcode_received(void *argument)
             case 466:
                 if (gcode->subcode == 1){
                     if (!gcode->has_letter('X') || !gcode->has_letter('Y') || !gcode->has_letter('H')){
-                        gcode->stream->printf("ALARM: Probe fail: Both X and Y axis and height need to be set for Square Probing\n");
+                        gcode->stream->printf("ERROR: Probe fail: Both X and Y axis and height need to be set for Square Probing\n");
                         THEKERNEL->call_event(ON_HALT, nullptr);
                         THEKERNEL->set_halt_reason(PROBE_FAIL);
                         return;
@@ -741,7 +765,7 @@ void ZProbe::on_gcode_received(void *argument)
                     }
                 }else{
                     if (!gcode->has_letter('X') && !gcode->has_letter('Y') && !gcode->has_letter('Z')){
-                        gcode->stream->printf("ALARM: Probe fail: No Axis Set\n");
+                        gcode->stream->printf("ERROR: Probe fail: No Axis Set\n");
                         THEKERNEL->call_event(ON_HALT, nullptr);
                         THEKERNEL->set_halt_reason(PROBE_FAIL);
                         return;
@@ -751,6 +775,9 @@ void ZProbe::on_gcode_received(void *argument)
                     }
                 }
                 break;                
+            case 468:
+                set_wcs_from_probe_result(gcode);
+                break;
             case 670:
                 if (gcode->has_letter('S')) this->slow_feedrate = gcode->get_value('S');
                 if (gcode->has_letter('K')) this->fast_feedrate = gcode->get_value('K');
@@ -770,7 +797,8 @@ void ZProbe::on_gcode_received(void *argument)
                 gcode->stream->printf(";Probe feedrates Slow/fast(K)/Return (mm/sec) max_z (mm) height (mm) dwell (s):\nM670 S%1.2f K%1.2f R%1.2f Z%1.2f H%1.2f D%1.2f\n",
                     this->slow_feedrate, this->fast_feedrate, this->return_feedrate, this->max_z, this->probe_height, this->dwell_before_probing);
 
-                // fall through is intended so leveling strategies can handle m-codes too
+                // fall through is intended so leveling strategies can handle m-codes too. Next line informs the compiler, do not edit it
+                // fall through
 
             default:
                 for(auto s : strategies){
@@ -820,7 +848,7 @@ bool ZProbe::probe_XYZ(Gcode *gcode)
     THEKERNEL->conveyor->wait_for_idle();
 
     if(this->pin.get() != invert_probe) {
-        gcode->stream->printf("Error:ZProbe triggered before move, aborting command.\n");
+        gcode->stream->printf("ERROR: ZProbe triggered before move, aborting command.\n");
         THEKERNEL->set_halt_reason(PROBE_FAIL);
         THEKERNEL->call_event(ON_HALT, nullptr);
         THEKERNEL->set_halt_reason(PROBE_FAIL);
@@ -839,7 +867,7 @@ bool ZProbe::probe_XYZ(Gcode *gcode)
     float delta[3]= {x, y, z};
     THEKERNEL->set_zprobing(true);
     if(!THEROBOT->delta_move(delta, rate, 3)) {
-    	gcode->stream->printf("ERROR: Move too small,  %1.3f, %1.3f, %1.3f\n", x, y, z);
+    	gcode->stream->printf("ERROR: Probing move too small,  %1.3f, %1.3f, %1.3f\n", x, y, z);
         THEKERNEL->set_halt_reason(PROBE_FAIL);
         THEKERNEL->call_event(ON_HALT, nullptr);
         probing = false;
@@ -871,10 +899,9 @@ bool ZProbe::probe_XYZ(Gcode *gcode)
 
     if(probeok == 0 && (gcode->subcode == 2 || gcode->subcode == 4)) {
         // issue error if probe was not triggered and subcode is 2 or 4
-        gcode->stream->printf("ALARM: Probe fail\n");
+        gcode->stream->printf("ERROR: Probe failed to trigger\n");
         THEKERNEL->set_halt_reason(PROBE_FAIL);
         THEKERNEL->call_event(ON_HALT, nullptr);
-        THEKERNEL->set_halt_reason(PROBE_FAIL);
         return false; //probe was not activated but failed due to subcodes
     }
     if(probeok == 0){
@@ -891,10 +918,10 @@ uint8_t ZProbe::check_probe_tool() {
     }
     
     // 3d probe tool
-    if ((tool.active_tool == 0 && this->tool_0_3axis) || tool.active_tool >= 999990){
+    if ((tool.active_tool == 0 && this->tool_0_3axis) || tool.active_tool >= 999990 || tool.active_tool == 9999){
         return 2;
     // probe tool in general
-    }else if (tool.active_tool == 0 || tool.active_tool >= 999990){
+    }else if (tool.active_tool == 0){ //removed extra compares that would never be reached
         return 1;
     }
     return 0;
@@ -950,7 +977,7 @@ void ZProbe::calibrate_Z(Gcode *gcode)
     reset_probe_tracking();
 
     // If calibration is happening with a probe tool, enable tracking of probe position in the read_probe ISR.
-    if (check_probe_tool() > 0) {
+    if (require_probe_trigger_for_calibration && check_probe_tool() > 0) {
         probing = true;
     }
 
@@ -958,7 +985,7 @@ void ZProbe::calibrate_Z(Gcode *gcode)
     float delta[3]= {0, 0, z};
     THEKERNEL->set_zprobing(true);
     if(!THEROBOT->delta_move(delta, rate, 3)) {
-        gcode->stream->printf("ERROR: Move too small,  %1.3f\n", z);
+        gcode->stream->printf("ERROR: Probing move too small,  %1.3f\n", z);
         THEKERNEL->set_halt_reason(PROBE_FAIL);
         THEKERNEL->call_event(ON_HALT, nullptr);
         calibrating = false;
@@ -986,9 +1013,6 @@ void ZProbe::calibrate_Z(Gcode *gcode)
     if (safety_margin_exceeded) {
         safety_margin_exceeded = false;
         THEKERNEL->set_halt_reason(PROBE_FAIL);
-        THEKERNEL->call_event(ON_HALT, nullptr);
-        gcode->stream->printf("ALARM: Probe failed to trigger within safety margin (%.2fmm)\n", 
-                             this->probe_calibration_safety_margin);
         gcode->stream->printf("Distance moved: %.3f\n", distance_moved);
         gcode->stream->printf("Probe pin triggered: %d, position: %.3f\n", probe_detected, probe_pin_position);
         gcode->stream->printf("Calibrate pin triggered: %d, position: %.3f\n", calibrate_detected, calibrate_pin_position);
@@ -996,6 +1020,8 @@ void ZProbe::calibrate_Z(Gcode *gcode)
         gcode->stream->printf("Error detected at position: %.3f\n", calibrate_current_z);
         gcode->stream->printf("Safety Margin Value: %.3f\n",  probe_calibration_safety_margin);
         gcode->stream->printf("debounce: %d, cali_debounce: %d, debounce_ms: %d\n", debounce, cali_debounce, debounce_ms);
+        gcode->stream->printf("ERROR: Probe failed to trigger within safety margin (%.2fmm). See MDI\n", this->probe_calibration_safety_margin);
+        THEKERNEL->call_event(ON_HALT, nullptr);
         return;
     }
 
@@ -1019,7 +1045,7 @@ void ZProbe::calibrate_Z(Gcode *gcode)
 
     if (calibrateok == 0) {
         // issue error if probe was not triggered and subcode is 2 or 4
-        gcode->stream->printf("ALARM: Calibrate fail!\n");
+        gcode->stream->printf("ERROR: Calibrate fail!\n");
         THEKERNEL->set_halt_reason(CALIBRATE_FAIL);
         THEKERNEL->call_event(ON_HALT, nullptr);
     }
@@ -1127,9 +1153,10 @@ float ZProbe::get_xyz_move_length(float x, float y, float z){
 }
 
 bool ZProbe::fast_slow_probe_sequence(int axis, int direction){
+    const uint32_t initial_probe_crash_count = probe_crash_count;
     float moveBuffer[3];
     float mpos[3];
-    float old_mpos[3];
+    //float old_mpos[3];
     float retract_direction = 0;
     float x = 0;
     float y = 0;
@@ -1188,19 +1215,26 @@ bool ZProbe::fast_slow_probe_sequence(int axis, int direction){
     memset(&this->buff, 0 , sizeof(this->buff));
     std::sprintf(this->buff, "G38.%i X%.3f Y%.3f Z%.3f F%.3f", 2 + param.probe_g38_subcode, THEROBOT->from_millimeters(x), THEROBOT->from_millimeters(y), THEROBOT->from_millimeters(z), param.feed_rate);
     this->gcodeBuffer = new Gcode(this->buff, &StreamOutput::NullStream);
-    probe_XYZ(this->gcodeBuffer);
+    bool probe_ok = probe_XYZ(this->gcodeBuffer);
     delete gcodeBuffer;
+    if (!probe_ok) return false;
+
     //move off the surface
     moveBuffer[0] = retractx;
     moveBuffer[1] = retracty;
     moveBuffer[2] = retractz;
     THEROBOT->delta_move(moveBuffer, param.feed_rate, 3);
+    THECONVEYOR->wait_for_idle();
+    if (probe_crash_count != initial_probe_crash_count) return false;
+
     //slow probe
     memset(&this->buff, 0 , sizeof(this->buff));
     std::sprintf(this->buff, "G38.%i X%.3f Y%.3f Z%.3f", 2 + param.probe_g38_subcode,THEROBOT->from_millimeters(x), THEROBOT->from_millimeters(y), THEROBOT->from_millimeters(z));
     this->gcodeBuffer = new Gcode(this->buff, &StreamOutput::NullStream);
-    probe_XYZ(this->gcodeBuffer);
+    probe_ok = probe_XYZ(this->gcodeBuffer);
     delete gcodeBuffer;
+    if (!probe_ok) return false;
+
     // always wait for idle before getting the machine pos
     THECONVEYOR->wait_for_idle();
     //store position
@@ -1241,7 +1275,7 @@ bool ZProbe::fast_slow_probe_sequence(int axis, int direction){
     THEROBOT->delta_move(moveBuffer, param.feed_rate, 3);
     // always wait for idle before getting the machine pos
     THECONVEYOR->wait_for_idle();
-    return probe_detected;
+    return probe_detected && probe_crash_count == initial_probe_crash_count;
 }
 
 int ZProbe::xy_probe_move_alarm_when_hit(int direction, int probe_g38_subcode, float x, float y, float feed_rate){
@@ -1251,7 +1285,7 @@ int ZProbe::xy_probe_move_alarm_when_hit(int direction, int probe_g38_subcode, f
     std::sprintf(this->buff, "G38.%i X%.3f Y%.3f F%.3f", 3+probe_g38_subcode,THEROBOT->from_millimeters(direction * x), THEROBOT->from_millimeters(direction * y), feed_rate);
     this->gcodeBuffer = new Gcode(this->buff, &StreamOutput::NullStream);
     if (probe_XYZ(this->gcodeBuffer)){
-        THEKERNEL->streams->printf("ALARM: Probe hit wall when moving to outer position\n");
+        THEKERNEL->streams->printf("ERROR: Probe hit wall when moving to outer position\n");
         THEKERNEL->call_event(ON_HALT, nullptr);
         THEKERNEL->set_halt_reason(PROBE_FAIL);
         delete gcodeBuffer;
@@ -1283,14 +1317,14 @@ void ZProbe::z_probe_move_with_retract(int probe_g38_subcode, float z, float cle
 bool ZProbe::parse_parameters(Gcode *gcode, bool override_probe_check){
     init_parameters_and_out_coords();
 
-    if (!((override_probe_check && THEKERNEL->eeprom_data->TOOL == 0) || (this->tool_0_3axis && THEKERNEL->eeprom_data->TOOL == 0) || THEKERNEL->eeprom_data->TOOL >= 999990)){
-        THEKERNEL->streams->printf("ALARM: Attempted to 3 axis probe with an improper tool number. Tool number needs to be >= 999990\n or you need to set tool 0 as a 3 axis probe with: \n config-set sd zprobe.tool_zero_is_3axis true \n");
+    if (!((override_probe_check && THEKERNEL->eeprom_data->TOOL == 0) || (this->tool_0_3axis && THEKERNEL->eeprom_data->TOOL == 0) || THEKERNEL->eeprom_data->TOOL >= 999990 || THEKERNEL->eeprom_data->TOOL == 9999)){
+        THEKERNEL->streams->printf("ERROR: Attempted to 3 axis probe with an improper tool number. Tool number needs to be >= 999990\n or you need to set tool 0 as a 3 axis probe with: \n config-set sd zprobe.tool_zero_is_3axis true \n");
         THEKERNEL->call_event(ON_HALT, nullptr);
         THEKERNEL->set_halt_reason(PROBE_FAIL);
         return false;
-    }else if(THEROBOT->get_probe_tool_not_calibrated() && gcode->has_letter('S') && (gcode->has_letter('H') || gcode->has_letter('Z'))){
+    }else if(THEROBOT->get_tool_not_calibrated() && gcode->has_letter('S') && (gcode->has_letter('H') || gcode->has_letter('Z'))){
         if(gcode->get_value('S') == 2){
-            THEKERNEL->streams->printf("ALARM: Probe not calibrated. Please calibrate probe before probing.\n");
+            THEKERNEL->streams->printf("ERROR: Probe not calibrated. Please calibrate probe before probing.\n");
             THEKERNEL->call_event(ON_HALT, nullptr);
             THEKERNEL->set_halt_reason(PROBE_FAIL);
             return false;
@@ -1384,14 +1418,14 @@ void ZProbe::probe_bore(bool calibration) //M461
     THEKERNEL->streams->printf("Probing Bore/Rectangular Pocket\n");
 
     float mpos[3];
-    float old_mpos[3];
+    //float old_mpos[3];
 
     if (calibration){
         param.tool_dia = 0;
     }
 
     if (param.repeat < 1){
-        THEKERNEL->streams->printf("ALARM: Probe fail: repeat value cannot be less than 1\n");
+        THEKERNEL->streams->printf("ERROR: Probe fail: repeat value cannot be less than 1\n");
         THEKERNEL->call_event(ON_HALT, nullptr);
         THEKERNEL->set_halt_reason(PROBE_FAIL);
         return;
@@ -1416,14 +1450,14 @@ void ZProbe::probe_bore(bool calibration) //M461
 	for(int i=0; i< param.repeat; i++) {
         if (param.x_axis_distance != 0) {
             // probe in positive x direction
-            fast_slow_probe_sequence(X_AXIS, POS);
+            if (!fast_slow_probe_sequence(X_AXIS, POS)) return;
 
             //THEKERNEL->streams->printf("X: %.3f Y: %.3f\n", out_coords.x_positive_x_out, out_coords.x_positive_y_out);
             //move back to the center position
             coordinated_move(out_coords.origin_x, out_coords.origin_y, NAN, param.rapid_rate);
 
             // probe in negative x direction
-            fast_slow_probe_sequence(X_AXIS, NEG);
+            if (!fast_slow_probe_sequence(X_AXIS, NEG)) return;
 
             //THEKERNEL->streams->printf("X: %.3f Y: %.3f\n", out_coords.x_negative_x_out, out_coords.x_negative_y_out);
             //calculate center of bore (will only be centered in x)
@@ -1443,7 +1477,7 @@ void ZProbe::probe_bore(bool calibration) //M461
 
         if (param.y_axis_distance != 0) {
             // probe in positive < direction
-            fast_slow_probe_sequence(Y_AXIS, POS);
+            if (!fast_slow_probe_sequence(Y_AXIS, POS)) return;
 
             //THEKERNEL->streams->printf("X: %.3f Y: %.3f\n", out_coords.y_positive_x_out, out_coordsy_positive_y_out);
             //goto current center position
@@ -1451,7 +1485,7 @@ void ZProbe::probe_bore(bool calibration) //M461
             THECONVEYOR->wait_for_idle();
             
             // probe in negative y direction
-            fast_slow_probe_sequence(Y_AXIS, NEG);
+            if (!fast_slow_probe_sequence(Y_AXIS, NEG)) return;
             
             //THEKERNEL->streams->printf("X: %.3f Y: %.3f\n", out_coords.x_negative_x_out, out_coords.x_negative_y_out);
             //calculate center of bore (will only be centered in x)
@@ -1477,11 +1511,11 @@ void ZProbe::probe_bore(bool calibration) //M461
 
     if (param.save_position > 0 && check_last_probe_ok()){
         if (param.x_axis_distance != 0 && param.y_axis_distance != 0){
-            THEROBOT->set_current_wcs_by_mpos( THEKERNEL->probe_outputs[3], THEKERNEL->probe_outputs[4], NAN);
+            THEROBOT->set_wcs_by_mpos( THEKERNEL->probe_outputs[3], THEKERNEL->probe_outputs[4], NAN);
         }else if (param.x_axis_distance != 0){
-            THEROBOT->set_current_wcs_by_mpos( THEKERNEL->probe_outputs[3], NAN, NAN);
+            THEROBOT->set_wcs_by_mpos( THEKERNEL->probe_outputs[3], NAN, NAN);
         }else if (param.y_axis_distance != 0){
-            THEROBOT->set_current_wcs_by_mpos( NAN, THEKERNEL->probe_outputs[4], NAN);
+            THEROBOT->set_wcs_by_mpos( NAN, THEKERNEL->probe_outputs[4], NAN);
         } 
     }
 }
@@ -1492,7 +1526,7 @@ void ZProbe::probe_boss(bool calibration) //M462
     THEKERNEL->streams->printf("Probing Boss or Rectangular Block\n");
     
     float mpos[3];
-    float old_mpos[3];
+    //float old_mpos[3];
     bool probe_x_axis = false;
     bool probe_y_axis = false;
 
@@ -1520,7 +1554,7 @@ void ZProbe::probe_boss(bool calibration) //M462
     int repeat_count = calibration ? 1 : param.repeat;
     
     if (repeat_count < 1){
-        THEKERNEL->streams->printf("ALARM: Probe fail: repeat value cannot be less than 1\n");
+        THEKERNEL->streams->printf("ERROR: Probe fail: repeat value cannot be less than 1\n");
         THEKERNEL->call_event(ON_HALT, nullptr);
         THEKERNEL->set_halt_reason(PROBE_FAIL);
         return;
@@ -1528,9 +1562,10 @@ void ZProbe::probe_boss(bool calibration) //M462
 	//slow zprobe without alarm to probe_height. Skip if probe height is 0
 	if (param.probe_height != 0){
         param.z_axis_distance = param.probe_height;
-        fast_slow_probe_sequence(Z_AXIS, POS);
+        if (!fast_slow_probe_sequence(Z_AXIS, POS)) return;
+        THEKERNEL->probe_outputs[5] = out_coords.z_negative_z_out;
         if (param.save_position == 2 && check_last_probe_ok()){
-            THEROBOT->set_current_wcs_by_mpos( NAN, NAN, out_coords.z_negative_z_out);
+            THEROBOT->set_wcs_by_mpos( NAN, NAN, out_coords.z_negative_z_out);
         }
         //z_probe_move_with_retract(param.probe_g38_subcode, -param.probe_height, param.clearance_height, param.feed_rate);
     }
@@ -1566,7 +1601,7 @@ void ZProbe::probe_boss(bool calibration) //M462
             }
 
             // probe in negative x direction
-            fast_slow_probe_sequence(X_AXIS, NEG);
+            if (!fast_slow_probe_sequence(X_AXIS, NEG)) return;
 
             //THEKERNEL->streams->printf("X: %.3f Y: %.3f\n", out_coords.x_positive_x_out, out_coords.x_positive_y_out);
             //goto clearance_world_pos in z
@@ -1588,7 +1623,7 @@ void ZProbe::probe_boss(bool calibration) //M462
             }
 
             // probe in positive x direction
-            fast_slow_probe_sequence(X_AXIS, POS);
+            if (!fast_slow_probe_sequence(X_AXIS, POS)) return;
 
             //THEKERNEL->streams->printf("X: %.3f Y: %.3f\n", out_coords.x_positive_x_out, out_coords.x_positive_y_out);
             //calculate center of bore (will only be centered in x)
@@ -1623,7 +1658,7 @@ void ZProbe::probe_boss(bool calibration) //M462
             }
             
             // probe in negative y direction
-            fast_slow_probe_sequence(Y_AXIS, NEG);
+            if (!fast_slow_probe_sequence(Y_AXIS, NEG)) return;
 
             //THEKERNEL->streams->printf("X: %.3f Y: %.3f\n", out_coords.y_positive_x_out, out_coords.y_positive_y_out);
             //goto clearance_world_pos in z
@@ -1645,7 +1680,7 @@ void ZProbe::probe_boss(bool calibration) //M462
             }
 
             // probe in positive y direction
-            fast_slow_probe_sequence(Y_AXIS, POS);
+            if (!fast_slow_probe_sequence(Y_AXIS, POS)) return;
             
             //THEKERNEL->streams->printf("X: %.3f Y: %.3f\n", out_coords.y_positive_x_out, out_coords.y_positive_y_out);
             //calculate center of bore (will only be centered in x)
@@ -1675,11 +1710,11 @@ void ZProbe::probe_boss(bool calibration) //M462
 
     if (param.save_position > 0 && check_last_probe_ok()){
         if (probe_x_axis && probe_y_axis){
-            THEROBOT->set_current_wcs_by_mpos( THEKERNEL->probe_outputs[3], THEKERNEL->probe_outputs[4], NAN);
+            THEROBOT->set_wcs_by_mpos( THEKERNEL->probe_outputs[3], THEKERNEL->probe_outputs[4], NAN);
         }else if (probe_x_axis){
-            THEROBOT->set_current_wcs_by_mpos( THEKERNEL->probe_outputs[3], NAN, NAN);
+            THEROBOT->set_wcs_by_mpos( THEKERNEL->probe_outputs[3], NAN, NAN);
         }else if (probe_y_axis){
-            THEROBOT->set_current_wcs_by_mpos( NAN, THEKERNEL->probe_outputs[4], NAN);
+            THEROBOT->set_wcs_by_mpos( NAN, THEKERNEL->probe_outputs[4], NAN);
         }
     }
 }
@@ -1689,7 +1724,7 @@ void ZProbe::probe_insideCorner() //M463
     float mpos[3];
 
     if (param.repeat < 1){
-        THEKERNEL->streams->printf("ALARM: Probe fail: repeat value cannot be less than 1\n");
+        THEKERNEL->streams->printf("ERROR: Probe fail: repeat value cannot be less than 1\n");
         THEKERNEL->call_event(ON_HALT, nullptr);
         THEKERNEL->set_halt_reason(PROBE_FAIL);
         return;
@@ -1718,7 +1753,7 @@ void ZProbe::probe_insideCorner() //M463
 	//setup repeat
 	for(int i=0; i< param.repeat; i++) {
         
-        fast_slow_probe_sequence(X_AXIS, POS);
+        if (!fast_slow_probe_sequence(X_AXIS, POS)) return;
 
         out_coords.x_positive_x_out = out_coords.x_positive_x_out + (param.x_axis_distance>= 0 ? 1.0f : -1.0f) *  param.half_tool_dia_rotated_x_x;
         out_coords.x_positive_y_out = out_coords.x_positive_y_out + (param.x_axis_distance>= 0 ? 1.0f : -1.0f) *  param.half_tool_dia_rotated_x_y;
@@ -1729,7 +1764,7 @@ void ZProbe::probe_insideCorner() //M463
         coordinated_move(out_coords.origin_x, out_coords.origin_y, NAN, param.rapid_rate );
         THECONVEYOR->wait_for_idle();
 
-        fast_slow_probe_sequence(Y_AXIS, POS);
+        if (!fast_slow_probe_sequence(Y_AXIS, POS)) return;
 
         out_coords.y_positive_y_out = out_coords.y_positive_y_out + (param.y_axis_distance>= 0 ? 1.0f : -1.0f) * param.half_tool_dia_rotated_y_y;
         out_coords.y_positive_x_out = out_coords.y_positive_x_out + (param.y_axis_distance>= 0 ? 1.0f : -1.0f) * param.half_tool_dia_rotated_y_x;
@@ -1761,7 +1796,7 @@ void ZProbe::probe_insideCorner() //M463
     THEKERNEL->streams->printf("Corner found. X coordinate stored in #154 as MCS %.3f , Y coordinate in #155 as MCS %.3f \n", THEKERNEL->probe_outputs[3], THEKERNEL->probe_outputs[4] );
     
     if (param.save_position > 0){
-        THEROBOT->set_current_wcs_by_mpos( THEKERNEL->probe_outputs[3], THEKERNEL->probe_outputs[4], NAN);
+        THEROBOT->set_wcs_by_mpos( THEKERNEL->probe_outputs[3], THEKERNEL->probe_outputs[4], NAN);
     }
 }
 
@@ -1773,7 +1808,7 @@ void ZProbe::probe_outsideCorner() //M464
     float mpos[3];
 
     if (param.repeat < 1){
-        THEKERNEL->streams->printf("ALARM: Probe fail: repeat value cannot be less than 1\n");
+        THEKERNEL->streams->printf("ERROR: Probe fail: repeat value cannot be less than 1\n");
         THEKERNEL->call_event(ON_HALT, nullptr);
         THEKERNEL->set_halt_reason(PROBE_FAIL);
         return;
@@ -1781,9 +1816,10 @@ void ZProbe::probe_outsideCorner() //M464
 	//slow zprobe without alarm to probe_height. Skip if probe height is 0
 	if (param.probe_height != 0){
         param.z_axis_distance = param.probe_height;
-        fast_slow_probe_sequence(Z_AXIS, POS);
+        if (!fast_slow_probe_sequence(Z_AXIS, POS)) return;
+        THEKERNEL->probe_outputs[5] = out_coords.z_negative_z_out;
         if (param.save_position == 2 && check_last_probe_ok()){
-            THEROBOT->set_current_wcs_by_mpos( NAN, NAN, out_coords.z_negative_z_out);
+            THEROBOT->set_wcs_by_mpos( NAN, NAN, out_coords.z_negative_z_out);
         }
         //z_probe_move_with_retract(param.probe_g38_subcode, -param.probe_height, param.clearance_height, param.feed_rate);
     }
@@ -1822,7 +1858,7 @@ void ZProbe::probe_outsideCorner() //M464
         }
         
         // probe in positive x direction
-        fast_slow_probe_sequence(X_AXIS, POS);
+        if (!fast_slow_probe_sequence(X_AXIS, POS)) return;
 
         out_coords.x_positive_x_out = out_coords.x_positive_x_out + (param.x_axis_distance>= 0 ? 1.0f : -1.0f) *  param.half_tool_dia_rotated_x_x;
         out_coords.x_positive_y_out = out_coords.x_positive_y_out + (param.x_axis_distance>= 0 ? 1.0f : -1.0f) *  param.half_tool_dia_rotated_x_y;
@@ -1848,7 +1884,7 @@ void ZProbe::probe_outsideCorner() //M464
         }
 
         // probe in positive y direction
-        fast_slow_probe_sequence(Y_AXIS, POS);
+        if (!fast_slow_probe_sequence(Y_AXIS, POS)) return;
 
         out_coords.y_positive_y_out = out_coords.y_positive_y_out + (param.y_axis_distance>= 0 ? 1.0f : -1.0f) * param.half_tool_dia_rotated_y_y;
         out_coords.y_positive_x_out = out_coords.y_positive_x_out + (param.y_axis_distance>= 0 ? 1.0f : -1.0f) * param.half_tool_dia_rotated_y_x;
@@ -1886,7 +1922,7 @@ void ZProbe::probe_outsideCorner() //M464
     THEKERNEL->streams->printf("Corner found. X coordinate stored in #154 as MCS %.3f , Y coordinate in #155 as MCS %.3f  \n", THEKERNEL->probe_outputs[3], THEKERNEL->probe_outputs[4] );
     
     if (param.save_position > 0 && check_last_probe_ok()){
-        THEROBOT->set_current_wcs_by_mpos(THEKERNEL->probe_outputs[3], THEKERNEL->probe_outputs[4], NAN);
+        THEROBOT->set_wcs_by_mpos(THEKERNEL->probe_outputs[3], THEKERNEL->probe_outputs[4], NAN);
     }
     if (param.save_position == 2){
         coordinated_move(NAN, NAN, out_coords.z_negative_z_out + 2, param.rapid_rate);
@@ -1915,7 +1951,7 @@ void ZProbe::probe_axisangle(bool probe_a_axis, bool probe_with_offset) //M465
         // Validate the values before using them
         if (isnan(machine_offset.anchor1_x) || isnan(machine_offset.anchor1_y) || 
             isnan(machine_offset.rotation_offset_x) || isnan(machine_offset.rotation_offset_y)) {
-            THEKERNEL->streams->printf("ALARM: Invalid machine offset values\n");
+            THEKERNEL->streams->printf("ERROR: Invalid machine offset values\n");
             THEKERNEL->call_event(ON_HALT, nullptr);
             THEKERNEL->set_halt_reason(PROBE_FAIL);
             return;
@@ -1928,7 +1964,7 @@ void ZProbe::probe_axisangle(bool probe_a_axis, bool probe_with_offset) //M465
         float target_y = machine_offset.anchor1_y + machine_offset.rotation_offset_y;
 
         if (isnan(target_x) || isnan(target_y)) {
-            THEKERNEL->streams->printf("ALARM: Invalid target coordinates\n");
+            THEKERNEL->streams->printf("ERROR: Invalid target coordinates\n");
             THEKERNEL->call_event(ON_HALT, nullptr);
             THEKERNEL->set_halt_reason(PROBE_FAIL);
             return;
@@ -1953,7 +1989,7 @@ void ZProbe::probe_axisangle(bool probe_a_axis, bool probe_with_offset) //M465
         }
 
         if (param.repeat < 1){
-            THEKERNEL->streams->printf("ALARM: Probe fail: repeat value cannot be less than 1\n");
+            THEKERNEL->streams->printf("ERROR: Probe fail: repeat value cannot be less than 1\n");
             THEKERNEL->call_event(ON_HALT, nullptr);
             THEKERNEL->set_halt_reason(PROBE_FAIL);
             return;
@@ -1999,34 +2035,34 @@ void ZProbe::probe_axisangle(bool probe_a_axis, bool probe_with_offset) //M465
 
             // probe along x axis to second position, alarm if hit
             if (xy_probe_move_alarm_when_hit(POS, param.probe_g38_subcode, 0.0, param.y_rotated_y, param.rapid_rate) == 1) {
-                THEKERNEL->streams->printf("ALARM: Probe fail: hit wall during first move\n");
+                THEKERNEL->streams->printf("ERROR: Probe fail: hit wall during first move\n");
                 THEKERNEL->call_event(ON_HALT, nullptr);
                 THEKERNEL->set_halt_reason(PROBE_FAIL);
                 return;
             }
             
-            fast_slow_probe_sequence(Z_AXIS, NEG);
+            if (!fast_slow_probe_sequence(Z_AXIS, NEG)) return;
             if (check_last_probe_ok()){
                 out_coords.y_positive_y_out = out_coords.z_negative_z_out;
             }else{
-                THEKERNEL->streams->printf("ALARM: Probe fail: first point not found\n");
+                THEKERNEL->streams->printf("ERROR: Probe fail: first point not found\n");
                 THEKERNEL->call_event(ON_HALT, nullptr);
                 THEKERNEL->set_halt_reason(PROBE_FAIL);
                 return;
             }
             
             if (xy_probe_move_alarm_when_hit(NEG, param.probe_g38_subcode, 0.0, 2 * param.y_rotated_y, param.rapid_rate) == 1) {
-                THEKERNEL->streams->printf("ALARM: Probe fail: hit wall during second move\n");
+                THEKERNEL->streams->printf("ERROR: Probe fail: hit wall during second move\n");
                 THEKERNEL->call_event(ON_HALT, nullptr);
                 THEKERNEL->set_halt_reason(PROBE_FAIL);
                 return;
             }
-            fast_slow_probe_sequence(Z_AXIS, NEG);
+            if (!fast_slow_probe_sequence(Z_AXIS, NEG)) return;
             if (check_last_probe_ok()){
                 out_coords.y_negative_y_out = out_coords.z_negative_z_out;
             }
             else{
-                THEKERNEL->streams->printf("ALARM: Probe fail: second point not found\n");
+                THEKERNEL->streams->printf("ERROR: Probe fail: second point not found\n");
                 THEKERNEL->call_event(ON_HALT, nullptr);
                 THEKERNEL->set_halt_reason(PROBE_FAIL);
                 return;
@@ -2039,11 +2075,11 @@ void ZProbe::probe_axisangle(bool probe_a_axis, bool probe_with_offset) //M465
 
         }else if (probe_x) {
             
-            fast_slow_probe_sequence(Y_AXIS, POS);
+            if (!fast_slow_probe_sequence(Y_AXIS, POS)) return;
             THECONVEYOR->wait_for_idle();
             
             if (!check_last_probe_ok()) {
-                THEKERNEL->streams->printf("ALARM: Probe fail: first point not found\n");
+                THEKERNEL->streams->printf("ERROR: Probe fail: first point not found\n");
                 THEKERNEL->call_event(ON_HALT, nullptr);
                 THEKERNEL->set_halt_reason(PROBE_FAIL);
                 return;
@@ -2057,18 +2093,18 @@ void ZProbe::probe_axisangle(bool probe_a_axis, bool probe_with_offset) //M465
             coordinated_move(out_coords.origin_x, out_coords.origin_y, NAN, param.rapid_rate );
             //probe along x axis to second position, alarm if hit
             if (xy_probe_move_alarm_when_hit(POS, param.probe_g38_subcode, param.x_rotated_x, param.x_rotated_y, param.rapid_rate) == 1) {
-                THEKERNEL->streams->printf("ALARM: Probe fail: hit wall during move to second position\n");
+                THEKERNEL->streams->printf("ERROR: Probe fail: hit wall during move to second position\n");
                 THEKERNEL->call_event(ON_HALT, nullptr);
                 THEKERNEL->set_halt_reason(PROBE_FAIL);
                 return;
             }
 
             //probe along y axis to find second point
-            fast_slow_probe_sequence(Y_AXIS, POS);
+            if (!fast_slow_probe_sequence(Y_AXIS, POS)) return;
             THECONVEYOR->wait_for_idle();
             
             if (!check_last_probe_ok()) {
-                THEKERNEL->streams->printf("ALARM: Probe fail: second point not found\n");
+                THEKERNEL->streams->printf("ERROR: Probe fail: second point not found\n");
                 THEKERNEL->call_event(ON_HALT, nullptr);
                 THEKERNEL->set_halt_reason(PROBE_FAIL);
                 return;
@@ -2088,11 +2124,11 @@ void ZProbe::probe_axisangle(bool probe_a_axis, bool probe_with_offset) //M465
             angle_measurements.push_back(current_angle);
             THEKERNEL->streams->printf("Measurement %d: Angle from X Axis is: %.3f degrees or %.3f radians\n" , i+1, current_angle, current_angle * pi / 180 );
         }else{
-            fast_slow_probe_sequence(X_AXIS, POS);
+            if (!fast_slow_probe_sequence(X_AXIS, POS)) return;
             THECONVEYOR->wait_for_idle();
             
             if (!check_last_probe_ok()) {
-                THEKERNEL->streams->printf("ALARM: Probe fail: first point not found\n");
+                THEKERNEL->streams->printf("ERROR: Probe fail: first point not found\n");
                 THEKERNEL->call_event(ON_HALT, nullptr);
                 THEKERNEL->set_halt_reason(PROBE_FAIL);
                 return;
@@ -2106,18 +2142,18 @@ void ZProbe::probe_axisangle(bool probe_a_axis, bool probe_with_offset) //M465
             coordinated_move(out_coords.origin_x, out_coords.origin_y, NAN, param.rapid_rate );
             //probe along x axis to second position, alarm if hit
             if (xy_probe_move_alarm_when_hit(POS, param.probe_g38_subcode, param.y_rotated_x, param.y_rotated_y, param.rapid_rate) == 1) {
-                THEKERNEL->streams->printf("ALARM: Probe fail: hit wall during move to second position\n");
+                THEKERNEL->streams->printf("ERROR: Probe fail: hit wall during move to second position\n");
                 THEKERNEL->call_event(ON_HALT, nullptr);
                 THEKERNEL->set_halt_reason(PROBE_FAIL);
                 return;
             }
 
             //probe along y axis to find second point
-            fast_slow_probe_sequence(X_AXIS, POS);
+            if (!fast_slow_probe_sequence(X_AXIS, POS)) return;
             THECONVEYOR->wait_for_idle();
             
             if (!check_last_probe_ok()) {
-                THEKERNEL->streams->printf("ALARM: Probe fail: second point not found\n");
+                THEKERNEL->streams->printf("ERROR: Probe fail: second point not found\n");
                 THEKERNEL->call_event(ON_HALT, nullptr);
                 THEKERNEL->set_halt_reason(PROBE_FAIL);
                 return;
@@ -2195,9 +2231,9 @@ void ZProbe::probe_axisangle(bool probe_a_axis, bool probe_with_offset) //M465
     }
     if (param.save_position == 1){
         if (probe_a_axis){
-            THEROBOT->set_current_wcs_by_mpos(NAN,NAN,NAN,a_axis_pos - THEKERNEL->probe_outputs[2],NAN,NAN);
+            THEROBOT->set_wcs_by_mpos(NAN,NAN,NAN,a_axis_pos - THEKERNEL->probe_outputs[2],NAN,NAN);
         }else{
-        THEROBOT->set_current_wcs_by_mpos(NAN,NAN,NAN,NAN,NAN,THEKERNEL->probe_outputs[2]);
+        THEROBOT->set_wcs_by_mpos(NAN,NAN,NAN,NAN,NAN,THEKERNEL->probe_outputs[2]);
         }
     }
 }
@@ -2208,7 +2244,7 @@ void ZProbe::probe_square(){
     float mpos[5];
 
     if (param.repeat < 1){
-        THEKERNEL->streams->printf("ALARM: Probe fail: repeat value cannot be less than 1\n");
+        THEKERNEL->streams->printf("ERROR: Probe fail: repeat value cannot be less than 1\n");
         THEKERNEL->call_event(ON_HALT, nullptr);
         THEKERNEL->set_halt_reason(PROBE_FAIL);
         return;
@@ -2254,7 +2290,7 @@ void ZProbe::probe_square(){
         // go to starting position
         coordinated_move(out_coords.origin_x, out_coords.origin_y, out_coords.origin_z, param.rapid_rate);
         for (int j = 0; j < 4; j++){
-            fast_slow_probe_sequence(Z_AXIS, NEG);
+            if (!fast_slow_probe_sequence(Z_AXIS, NEG)) return;
             z_pos[j] = out_coords.z_negative_z_out;
             if (j == 0){
                 min_z = max_z = z_pos[j];
@@ -2424,7 +2460,7 @@ void ZProbe::single_axis_probe_double_tap(){
     THEKERNEL->streams->printf("Probing Single Axis\n");
 
     if (param.repeat < 1){
-        THEKERNEL->streams->printf("ALARM: Probe fail: repeat value cannot be less than 1\n");
+        THEKERNEL->streams->printf("ERROR: Probe fail: repeat value cannot be less than 1\n");
         THEKERNEL->call_event(ON_HALT, nullptr);
         THEKERNEL->set_halt_reason(PROBE_FAIL);
         return;
@@ -2449,7 +2485,7 @@ void ZProbe::single_axis_probe_double_tap(){
 
         THECONVEYOR->wait_for_idle();
         // POS doesn't do anything here since it's a XYZ Probe move
-        fast_slow_probe_sequence(XYZ, POS);
+        if (!fast_slow_probe_sequence(XYZ, POS)) return;
 
         THECONVEYOR->wait_for_idle();
         
@@ -2495,7 +2531,7 @@ void ZProbe::single_axis_probe_double_tap(){
         THEKERNEL->probe_outputs[3] = ave_x;
         THEKERNEL->probe_outputs[4] = ave_y;
         if (param.save_position > 0 && check_last_probe_ok()){
-            THEROBOT->set_current_wcs_by_mpos( THEKERNEL->probe_outputs[3], THEKERNEL->probe_outputs[4], NAN);
+            THEROBOT->set_wcs_by_mpos( THEKERNEL->probe_outputs[3], THEKERNEL->probe_outputs[4], NAN);
         }
     } else if(param.x_axis_distance != 0){
         THEKERNEL->streams->printf("--- Machine Coordinates ---\n");
@@ -2504,7 +2540,7 @@ void ZProbe::single_axis_probe_double_tap(){
         THEKERNEL->streams->printf("Final Position X: %.3f\n", std::get<X_AXIS>(pos));
         THEKERNEL->probe_outputs[3] = ave_x;
         if (param.save_position > 0 && check_last_probe_ok()){
-            THEROBOT->set_current_wcs_by_mpos( THEKERNEL->probe_outputs[3], NAN, NAN);
+            THEROBOT->set_wcs_by_mpos( THEKERNEL->probe_outputs[3], NAN, NAN);
         }
     } else if(param.y_axis_distance != 0){
         THEKERNEL->streams->printf("--- Machine Coordinates ---\n");
@@ -2513,7 +2549,7 @@ void ZProbe::single_axis_probe_double_tap(){
         THEKERNEL->streams->printf("Final Position Y: %.3f\n", std::get<Y_AXIS>(pos));
         THEKERNEL->probe_outputs[4] = ave_y;
         if (param.save_position > 0 && check_last_probe_ok()){
-            THEROBOT->set_current_wcs_by_mpos( NAN, THEKERNEL->probe_outputs[4], NAN);
+            THEROBOT->set_wcs_by_mpos( NAN, THEKERNEL->probe_outputs[4], NAN);
         }
     }
     if (param.z_axis_distance != 0){
@@ -2523,8 +2559,133 @@ void ZProbe::single_axis_probe_double_tap(){
         THEKERNEL->streams->printf("Final Positon Z: %.3f\n", std::get<Z_AXIS>(pos));
         THEKERNEL->probe_outputs[5] = ave_z;
         if (param.save_position == 2 && check_last_probe_ok()){
-            THEROBOT->set_current_wcs_by_mpos( NAN, NAN, THEKERNEL->probe_outputs[5]);
+            THEROBOT->set_wcs_by_mpos( NAN, NAN, THEKERNEL->probe_outputs[5]);
         }
+    }
+}
+
+// M468: compare the last probing result with the expected values and, with S1, update a work
+// coordinate system so the probed point lands on them. Only the given axes are updated.
+// P: work coordinate system, 1 = G54 to 9 = G59.3, 0 or omitted = active one
+// X, Y, Z: expected coordinates of the probed point (#154, #155, #156)
+// R: expected angle of the probed edge; S1 sets the rotation to #153 - R
+// D, E: expected size in X and Y (#151, #152), checked only
+// T: position tolerance; U: size tolerance; Q: angle tolerance
+// W1: print measured values and deviations
+// S1: update the WCS; without it, nothing is written
+// If a check fails, nothing is written and the machine halts.
+void ZProbe::set_wcs_from_probe_result(Gcode *gcode)
+{
+    auto fail = [](const char *reason) {
+        THEKERNEL->streams->printf("ERROR: M468: %s\n", reason);
+        THEKERNEL->call_event(ON_HALT, nullptr);
+        THEKERNEL->set_halt_reason(PROBE_FAIL);
+    };
+
+    size_t n = THEROBOT->get_current_wcs();
+    if (gcode->has_letter('P')) {
+        int p = gcode->get_int('P');
+        if (p < 0 || p > (int)MAX_WCS) {
+            fail("P must be 0 to 9");
+            return;
+        }
+        if (p > 0) n = p - 1;
+    }
+
+    bool set_x = gcode->has_letter('X');
+    bool set_y = gcode->has_letter('Y');
+    bool set_z = gcode->has_letter('Z');
+    bool set_angle = gcode->has_letter('R');
+    bool size_x = gcode->has_letter('D');
+    bool size_y = gcode->has_letter('E');
+    if (!set_x && !set_y && !set_z && !set_angle && !size_x && !size_y) {
+        fail("no X, Y, Z, R, D or E given");
+        return;
+    }
+
+    // a result is set when it is above the unset value, as for #151-#156
+    const float *result = THEKERNEL->probe_outputs;
+    auto measured = [result](int i) { return result[i] > -100000; };
+    if ((set_x && !measured(3)) || (set_y && !measured(4)) || (set_z && !measured(5)) ||
+        (set_angle && !measured(2)) || (size_x && !measured(0)) || (size_y && !measured(1))) {
+        fail("the last probing cycle did not measure the given axis");
+        return;
+    }
+
+    float nx = set_x ? THEROBOT->to_millimeters(gcode->get_value('X')) : 0;
+    float ny = set_y ? THEROBOT->to_millimeters(gcode->get_value('Y')) : 0;
+    float nz = set_z ? THEROBOT->to_millimeters(gcode->get_value('Z')) : 0;
+    float na = set_angle ? gcode->get_value('R') : 0;
+
+    // the probed point in that system before the change. An axis that was not probed is taken
+    // from the current position.
+    float mpos[3];
+    THEROBOT->get_current_machine_position(mpos);
+    float px = measured(3) ? result[3] : mpos[X_AXIS];
+    float py = measured(4) ? result[4] : mpos[Y_AXIS];
+    float pz = measured(5) ? result[5] : mpos[Z_AXIS];
+    Robot::wcs_t pos = THEROBOT->mcs2selected_wcs(Robot::wcs_t(px, py, pz, 0, 0), n);
+
+    // deviation = measured - nominal, which is also how far the system moves or turns
+    struct check { bool given; char name; float measured; float nominal; char tolerance; };
+    check checks[] = {
+        {set_x, 'X', std::get<X_AXIS>(pos), nx, 'T'},
+        {set_y, 'Y', std::get<Y_AXIS>(pos), ny, 'T'},
+        {set_z, 'Z', std::get<Z_AXIS>(pos), nz, 'T'},
+        {set_angle, 'R', result[2] - THEROBOT->r[n], na, 'Q'},
+        {size_x, 'D', result[0], size_x ? THEROBOT->to_millimeters(gcode->get_value('D')) : 0, 'U'},
+        {size_y, 'E', result[1], size_y ? THEROBOT->to_millimeters(gcode->get_value('E')) : 0, 'U'},
+    };
+    bool print = gcode->has_letter('W') && gcode->get_int('W') > 0;
+    for (const check &c : checks) {
+        if (c.given && print) {
+            THEKERNEL->streams->printf("M468 %c: measured %.3f, nominal %.3f, deviation %.3f\n",
+                c.name, c.measured, c.nominal, c.measured - c.nominal);
+        }
+    }
+    for (const check &c : checks) {
+        if (!c.given || !gcode->has_letter(c.tolerance)) continue;
+        float tolerance = gcode->get_value(c.tolerance);
+        if (c.tolerance != 'Q') tolerance = THEROBOT->to_millimeters(tolerance);
+        if (fabs(c.measured - c.nominal) > tolerance) {
+            char reason[96];
+            snprintf(reason, sizeof(reason), "%c deviation %.3f is outside the tolerance %.3f, nothing written",
+                c.name, c.measured - c.nominal, tolerance);
+            fail(reason);
+            return;
+        }
+    }
+
+    if (!gcode->has_letter('S') || gcode->get_int('S') != 1) {
+        return;
+    }
+
+    if (!set_x && !set_y && !set_z && !set_angle) {
+        return;
+    }
+
+    // The offset that puts the given coordinates of the probed point on the probed point, with the
+    // new rotation. An axis that was not given keeps its current coordinate.
+    float rotation = set_angle ? result[2] - na : THEROBOT->r[n];
+    Robot::wcs_t target(set_x ? nx : std::get<X_AXIS>(pos), set_y ? ny : std::get<Y_AXIS>(pos),
+                        set_z ? nz : std::get<Z_AXIS>(pos), 0, 0);
+    Robot::wcs_t wanted = THEROBOT->wcs_offset_for(target, Robot::wcs_t(px, py, pz, 0, 0), n, rotation);
+
+    // Only the given axes change. X and Y change together, as a rotated system couples them.
+    Robot::wcs_t offset = THEROBOT->get_wcs_offset(n);
+    if (set_x || set_y) {
+        std::get<X_AXIS>(offset) = std::get<X_AXIS>(wanted);
+        std::get<Y_AXIS>(offset) = std::get<Y_AXIS>(wanted);
+    }
+    if (set_z) std::get<Z_AXIS>(offset) = std::get<Z_AXIS>(wanted);
+
+    // one write, so the EEPROM is saved once
+    THEROBOT->set_wcs_offset(n, offset, rotation);
+
+    if (n < 6) {
+        THEKERNEL->streams->printf("G%d set from probing result\n", 54 + (int)n);
+    } else {
+        THEKERNEL->streams->printf("G59.%d set from probing result\n", (int)n - 5);
     }
 }
 

@@ -19,6 +19,7 @@ public:
     void on_gcode_received(void *argument);
     void on_get_public_data(void *argument);
     void on_set_public_data(void *argument);
+    void on_abort(void *argument);
     void on_main_loop( void* argument );
     void on_halt(void *argument);
     int get_active_tool() const { return active_tool; }
@@ -58,7 +59,17 @@ private:
 		BP_COMPLETE,//job complete
 		BP_TOOL, 	//change tools
     } BEEP_STATUS;
+    typedef enum {
+        UNDEFINED = 0,
+        COLLET_3 = 1,
+        COLLET_1_8 = 2,
+        COLLET_4 = 3,
+        COLLET_6 = 4,
+        COLLET_1_4 = 5,
+        COLLET_8 = 6,
+    } COLLET_TYPE;
     
+    COLLET_TYPE target_collet_type;
     ATC_STATUS atc_status;
     
 
@@ -85,17 +96,18 @@ private:
     void abort();
 
     // set tool offset afteer calibrating
-    void set_tool_offset();
+    void set_tool_offset(uint8_t repeat_count = 1);
 
     //
-    void fill_change_scripts(int new_tool, bool clear_z);
+    void fill_change_scripts(int new_tool, bool clear_z, int old_tool, bool wait_after_empty, uint8_t colletIndex, float custom_TLO, bool activate_tool = true);
     void fill_drop_scripts(int old_tool);
     void fill_pick_scripts(int new_tool, bool clear_z);
-    void fill_cali_scripts(bool is_probe, bool clear_z);
+    void fill_cali_scripts(bool is_probe, bool clear_z, int repeat_count = 1, int pending_tool = -1);
 
     //
     void fill_manual_drop_scripts(int old_tool);
     void fill_manual_pickup_scripts(int new_tool, bool clear_z, bool auto_calibrate, float custom_TLO);
+    void queue_manual_tool_change_position(bool force_absolute);
 
     //
     void fill_margin_scripts(float x_pos, float y_pos, float x_pos_max, float y_pos_max);
@@ -114,8 +126,19 @@ private:
     void calibrate_anchor2(Gcode *gcode);
     void calibrate_a_axis_headstock(Gcode *gcode);
     void calibrate_a_axis_height(Gcode *gcode);
+    void calibrate_a_axis_cor(Gcode *gcode);
+    void calibrate_a_axis_cor_step();
+    void cor_queue_orbit_top();
+    void cor_queue_arc(bool clockwise, float dy, float dz, float j, float k, float da);
+    void cor_queue_probe(char axis, float distance);
+    void cor_queue_to_front();
+    void cor_queue_to_back();
+    void cor_queue_to_top();
+    void cor_queue_probe_module_ref();
     void home_machine_with_pin(Gcode *gcode);
     void calibrate_set_value(Gcode *gcode);
+
+    void stock_firmware_inner_corner_probe(float x_val, float y_val, float z_val, float d_val);
 
     void clear_script_queue();
 
@@ -130,6 +153,7 @@ private:
     uint16_t debounce;
     bool atc_homing;
     bool detecting;
+    bool disable_toolsensor;
 
     bool playing_file;
     bool g28_triggered;
@@ -173,6 +197,8 @@ private:
     float probe_slow_rate;
     float probe_retract_mm;
     float probe_height_mm;
+    float three_axis_probe_tlo_correction;
+    bool require_probe_trigger_for_calibration;
 
     // Configurable probe position (absolute Machine Coordinate System)
     float probe_mcs_x;
@@ -199,9 +225,32 @@ private:
     float rotation_offset_z;
     float rotation_width = 100;
 
+    // M469.6 A-axis center-of-rotation calibration state
+    struct {
+        uint8_t phase;         // CorPhase in ATCHandler.cpp
+        uint8_t pass;          // 1 = first measure, 2 = convergence
+        bool invert_probe;
+        float artifact_dia;
+        float tip_r;           // probe tip radius
+        float probe_travel;    // clearance * 2
+        float pos_feed;
+        float y_clr;           // orbit radius: axis to ball centre at the C clearance
+        float z_ctr;           // ball-geometry Z offset for side probing
+        float z_corr;          // three_axis_probe_tlo_correction
+        float start_y;         // orbit centre Y in MCS (axis estimate)
+        float start_a;         // starting A MCS
+        float z_centerline;    // orbit centre Z: tip Z for Y probing at the axis height
+        float y1, y2;          // Y contacts (tip-radius compensated)
+        float y_center;        // Y CoR in MCS
+        float z_cor_mcs;       // Z CoR in MCS (from artifact probes)
+    } a_axis_cor;
+
     float toolrack_offset_x;
     float toolrack_offset_y;
     float toolrack_z;
+    float manual_tool_change_x;
+    float manual_tool_change_y;
+    float manual_probe_z;
 
     float clearance_x;
     float clearance_y;
@@ -271,6 +320,7 @@ private:
     int target_tool;
     int tool_number;
     int max_manual_tool_number;
+    int lowest_tool_number;
     int goto_position;
     float position_x;
     float position_y;
@@ -280,6 +330,8 @@ private:
     float ref_tool_mz;
     float cur_tool_mz;
     float tool_offset;
+    const uint8_t max_tl_mcz_values = 5;
+    deque<float> tl_mcz_values = deque<float>(max_tl_mcz_values, 0.0f);
     int beep_state;
     int beep_count;
 

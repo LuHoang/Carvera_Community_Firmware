@@ -6,6 +6,7 @@
 */
 
 #include "GcodeDispatch.h"
+#include "libs/FirmwareFileSystem.h"
 
 #include "libs/Kernel.h"
 #include "Robot.h"
@@ -173,7 +174,7 @@ try_again:
 							THEKERNEL->call_event(ON_HALT, (void *)1); // clears on_halt
 							new_message.stream->printf("WARNING: After HALT you should HOME as position is currently unknown\n");
 						}
-						new_message.stream->printf("ok\n");
+						new_message.stream->printf("ok\r\n");
 						delete gcode;
 						return;
 
@@ -224,7 +225,7 @@ try_again:
 						// optimize G1 to send ok immediately (one per line) before it is planned
 						if(!sent_ok) {
 							sent_ok= true;
-							new_message.stream->printf("ok\n");
+							new_message.stream->printf("ok\r\n");
 						}
 					}
 
@@ -235,13 +236,21 @@ try_again:
 				}
 
 				if(gcode->has_m) {
+#if defined(NO_SD_CARD)
+					if (gcode->m == 28 || (gcode->m >= 500 && gcode->m <= 504 && gcode->m != 503)) {
+						new_message.stream->printf("ERROR: File storage is not available on this machine\r\n");
+						delete gcode;
+						continue;
+					}
+#endif
 					switch (gcode->m) {
+#if !defined(NO_SD_CARD)
 						case 28: // start upload command
 							delete gcode;
 
 							this->upload_filename = "/sd/" + single_command.substr(4); // rest of line is filename
 							// open file
-							upload_fd = fopen(this->upload_filename.c_str(), "w");
+							upload_fd = fwfs::fopen(this->upload_filename.c_str(), "w");
 							if(upload_fd != NULL) {
 								this->uploading = true;
 								new_message.stream->printf("Writing to file: %s\r\nok\r\n", this->upload_filename.c_str());
@@ -254,10 +263,12 @@ try_again:
 
 							//printf("Start Uploading file: %s, %p\n", upload_filename.c_str(), upload_fd);
 							continue;
+#endif
 
 						case 30: // end of program
 							if(!THEKERNEL->is_grbl_mode()) break; // Special case M30 as it is also delete sd card file so only do this if in grbl mode
-							// fall through to M2
+							// fall through to M2. Next line informs the compiler. Do not edit it
+							// fall through
 						case 2:
 							{
 								modal_group_1= 1; // set to G1
@@ -273,8 +284,9 @@ try_again:
 							// this is also handled out-of-band (it is now with ^X in the serial driver)
 							// disables heaters and motors, ignores further incoming Gcode and clears block queue
 							THEKERNEL->set_halt_reason(MANUAL);
+							
+							THEKERNEL->streams->printf("ERROR: ok Emergency Stop Requested - reset or M999 required to exit HALT state\r\n");
 							THEKERNEL->call_event(ON_HALT, nullptr);
-							THEKERNEL->streams->printf("ok Emergency Stop Requested - reset or M999 required to exit HALT state\r\n");
 							delete gcode;
 							return;
 
@@ -296,9 +308,9 @@ try_again:
 							#endif
 
 							if(THEKERNEL->is_bad_mcu()) {
-								new_message.stream->printf(", X-WARNING:deprecated_MCU");
+								new_message.stream->printf(", X-WARNING:deprecated_MCU\n");
 							}
-							new_message.stream->printf("\nok\n");
+							new_message.stream->printf("ok\r\n");
 							return;
 						}
 
@@ -315,7 +327,16 @@ try_again:
 						{    // concatenate the command again and send to the MDI
 							if (gcode->subcode == 1){
 								if (gcode->has_letter('P')) {
-									THEKERNEL->streams->printf("result = %.3f \n", gcode->get_value('P'));
+									float final_value = gcode->get_value('P');
+									size_t ppos = single_command.find_first_of("P");
+									if (ppos == string::npos || ppos + 1 >= single_command.length()) {
+										THEKERNEL->streams->printf("no value for M118.1 command\r\n");
+										delete gcode;
+										return;
+									}
+									string str = single_command.substr(ppos + 1);
+									str += possible_command;
+									THEKERNEL->streams->printf(" %s = %.3f \r\n", str.c_str(), final_value); // the space at the start is important for variable displays
 									delete gcode;
 									return;
 								}
@@ -351,6 +372,13 @@ try_again:
 							return;
 						}
 
+						case 400: // M400 Wait for all moves to complete (sync point before M-codes)
+							THEKERNEL->conveyor->wait_for_idle();
+							delete gcode;
+							new_message.stream->printf("ok\r\n");
+							return;
+
+#if !defined(NO_SD_CARD)
 						case 500: // M500 save volatile settings to config-override
 							THEKERNEL->conveyor->wait_for_idle(); //just to be safe as it can take a while to run
 							//remove(THEKERNEL->config_override_filename()); // seems to cause a hang every now and then
@@ -384,20 +412,23 @@ try_again:
 							return;
 
 						case 502: // M502 deletes config-override so everything defaults to what is in config
-							remove(THEKERNEL->config_override_filename());
+							fwfs::remove(THEKERNEL->config_override_filename());
 							delete gcode;
 							new_message.stream->printf("config override file deleted %s, reboot needed\r\nok\r\n", THEKERNEL->config_override_filename());
 							continue;
+#endif
 
 						case 503: { // M503 display live settings and indicates if there is an override file
-							FILE *fd = fopen(THEKERNEL->config_override_filename(), "r");
+#if !defined(NO_SD_CARD)
+							FILE *fd = fwfs::fopen(THEKERNEL->config_override_filename(), "r");
 							if(fd != NULL) {
-								fclose(fd);
+								fwfs::fclose(fd);
 								new_message.stream->printf("; config override present: %s\n",  THEKERNEL->config_override_filename());
 
 							} else {
 								new_message.stream->printf("; No config override\n");
 							}
+#endif
 							gcode->add_nl= true;
 							break; // fall through to process by modules
 						}
@@ -426,7 +457,7 @@ try_again:
 					}
 
 					// we cannot continue safely after an error so we enter HALT state
-					new_message.stream->printf("Entering Alarm/Halt state\n");
+					new_message.stream->printf("ERROR: error in gcode. See MDI for more details\n");
 					THEKERNEL->call_event(ON_HALT, nullptr);
 
 				}else if(!sent_ok) {
@@ -452,11 +483,12 @@ try_again:
 
 				delete gcode;
 
+#if !defined(NO_SD_CARD)
 			} else {
 				// we are uploading and it is the upload stream so so save it
 				if(single_command.substr(0, 3) == "M29") {
 					// done uploading, close file
-					fclose(upload_fd);
+					fwfs::fclose(upload_fd);
 					upload_fd = NULL;
 					uploading = false;
 					upload_filename.clear();
@@ -472,10 +504,10 @@ try_again:
 				}
 
 				single_command.append("\n");
-				if(fwrite(single_command.c_str(), 1, single_command.size(), upload_fd) != single_command.size()) {
+				if(fwfs::fwrite(single_command.c_str(), 1, single_command.size(), upload_fd) != single_command.size()) {
 					// error writing to file
 					new_message.stream->printf("Error:error writing to file.\r\n");
-					fclose(upload_fd);
+					fwfs::fclose(upload_fd);
 					upload_fd = NULL;
 					continue;
 
@@ -483,11 +515,12 @@ try_again:
 					 new_message.stream->printf("ok\r\n");
 					//printf("uploading file write ok\n");
 				}
+#endif
 			}
 		}
     } else if ( first_char == ';' || first_char == '(' || first_char == '\n' || first_char == '\r' ) {
         // Ignore comments and blank lines
-        new_message.stream->printf("ok\n");
+        new_message.stream->printf("ok\r\n");
 
     } else if( (n=possible_command.find_first_of("XYZAF")) == 0 || (first_char == ' ' && n != string::npos) ) {
         // handle pycam syntax, use last modal group 1 command and resubmit if an X Y Z or F is found on its own line
@@ -505,7 +538,6 @@ try_again:
 
     } else {
         // an uppercase non command word on its own (except XYZAF) just returns ok, we could add an error but no hosts expect that.
-        new_message.stream->printf("ok - ignore: [%s]\n", possible_command.c_str());
+        new_message.stream->printf("ok - ignore: [%s]\r\n", possible_command.c_str());
     }
 }
-

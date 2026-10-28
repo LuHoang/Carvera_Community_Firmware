@@ -27,7 +27,7 @@ class PWMSpindleControl: public SpindleControl {
         void on_set_public_data(void *argument);
         void on_idle(void* argument);
 
-    private:
+    protected:
         
         void on_pin_rise();
         uint32_t on_update_speed(uint32_t dummy);
@@ -49,13 +49,19 @@ class PWMSpindleControl: public SpindleControl {
         uint32_t last_irq;
 
         // Values from config
+        float max_rpm;
         volatile float pulses_per_rev;
         float control_P_term;
         float control_I_term;
         float control_D_term;
+        float control_P_scale;
+        float control_D_scale;
+        float min_running_pwm;
+        bool delayed_D_control;
         float smoothing_decay;
         float max_pwm;
-        int  delay_s;
+        int  delay_on_s;
+        int  delay_off_s;
         int  stall_s;
         int  stall_count_rpm;
         int  stall_alarm_rpm;

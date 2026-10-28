@@ -9,37 +9,86 @@
 #define ANALOG_SPINDLE_MODULE_H
 
 #include "SpindleControl.h"
+#include <stdint.h>
+#include "Pin.h"
 
 namespace mbed {
     class PwmOut;
+    class InterruptIn;
 }
 
-class Pin;
+class Gcode;
+class StreamOutput;
 
-// This module implements control of the spindle speed by seting a PWM from 0-100% which needs
-// to be converted to 0-10V by an external circuit
+// Open-loop PWM spindle. While running, duty = offset + scale * (rpm / max_rpm),
+// then limited to [deadzone_bottom, 1 - deadzone_top]. Off writes duty 0.
 class AnalogSpindleControl: public SpindleControl {
     public:
-        AnalogSpindleControl() {};
+        AnalogSpindleControl() : feedback_pin(nullptr) {};
         virtual ~AnalogSpindleControl() {};
         void on_module_loaded();
-        
+        void on_get_public_data(void* argument);
+        void on_set_public_data(void* argument);
+        void on_idle(void* argument);
+
     private:
-       
-        Pin *switch_on; // digital output for switching the VFD on 
-        mbed::PwmOut *pwm_pin; // PWM output for spindle speed control
+        void on_pin_rise();
+        uint32_t on_update_speed(uint32_t dummy);
+        bool get_alarm(void);
+
+        void apply_pwm_from_targets(void);
+
+        Pin *switch_on;
+        mbed::PwmOut *pwm_pin;
+        mbed::InterruptIn *feedback_pin;
         bool output_inverted;
-        
-        int target_rpm;
+
+        float target_rpm;
+        float current_rpm;
+        float current_pwm_value;
+        float factor;
         int min_rpm;
         int max_rpm;
+        // Duty added to the scaled command, and PWM change across 0..max_rpm.
+        float pwm_offset;
+        float pwm_scale;
+        // Lowest duty that turns the spindle, and unused duty at the top of the range.
+        float pwm_deadzone_bottom;
+        float pwm_deadzone_top;
+        int delay_s;
+        int delay_on_s;
+        int delay_off_s;
+        bool tuning;
+        bool tune_cancel;
+
+        float pulses_per_rev;
+        float acc_ratio;
+        float smoothing_decay;
+        int time_since_update;
+        uint32_t last_rev_time;
+        volatile uint32_t rev_time;
+        volatile uint32_t irq_count;
+        Pin alarm_pin;
 
         void turn_on(void);
         void turn_off(void);
         void set_speed(int);
         void report_speed(void);
-        void update_pwm(float); 
+        void update_pwm(float);
+        void set_factor(float);
+        void on_analog_settings(Gcode *gcode) override;
+
+        void read_pwm_map(void);
+        void sanitize_pwm_map(void);
+        void report_map(StreamOutput *stream) const;
+        float pwm_for_rpm(float rpm) const;
+        float rpm_from_pwm(float duty) const;
+        void auto_tune(StreamOutput *stream, float step, uint32_t step_ms, int sweeps, bool apply, bool validate);
+        void validate_map(StreamOutput *stream, float step);
+        bool sample_commanded_speeds(StreamOutput *stream, int intervals, uint32_t min_ms, uint32_t max_ms, float &requested, float &measured);
+        bool measure_start_stop_times(StreamOutput *stream, int &on_s, int &off_s);
+        void dwell_seconds(int seconds);
+        bool wait_for_stable_rpm(float &rpm, uint32_t min_ms, uint32_t max_ms);
 };
 
 #endif
-

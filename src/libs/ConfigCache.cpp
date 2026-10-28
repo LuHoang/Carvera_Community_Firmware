@@ -1,10 +1,15 @@
 #include "ConfigCache.h"
-#include "ConfigValue.h"
 
+#include "libs/Kernel.h"
 #include "libs/StreamOutput.h"
+#include "libs/StreamOutputPool.h"
+#include <new>
 
 ConfigCache::ConfigCache()
 {
+    first = NULL;
+    last = NULL;
+    count = 0;
 }
 
 ConfigCache::~ConfigCache()
@@ -14,49 +19,76 @@ ConfigCache::~ConfigCache()
 
 void ConfigCache::clear()
 {
-    for (auto &kv : store)  {
-        delete kv;
+    while(first != NULL) {
+        Chunk *next = first->next;
+        delete first;
+        first = next;
     }
-    store.clear();
-    storage_t().swap(store);   //  makes sure the vector releases its memory
-}
-
-void ConfigCache::add(ConfigValue *v)
-{
-    store.push_back(v);
+    last = NULL;
+    count = 0;
 }
 
 void ConfigCache::pop()
 {
-    auto cv= store.back();
-    store.pop_back();
-    delete cv;
+    if(last == NULL) return;
+
+    last->used--;
+    count--;
+    if(last->used != 0) return;
+
+    if(first == last) {
+        delete last;
+        first = last = NULL;
+        return;
+    }
+
+    Chunk *previous = first;
+    while(previous->next != last) previous = previous->next;
+    delete last;
+    last = previous;
+    last->next = NULL;
 }
 
-// If we find an existing value, replace it, otherwise, push it at the back of the list
-void ConfigCache::replace_or_push_back(ConfigValue *new_value)
+// If we find an existing value, replace it, otherwise copy it to the back.
+// Returns a pointer to the entry in the store.
+ConfigValue *ConfigCache::replace_or_push_back(const ConfigValue &new_value)
 {
-    // For each already existing element
-    for(auto &cv : store) {
-        // If this configvalue matches the checksum
-        if(memcmp(new_value->check_sums, cv->check_sums, sizeof(cv->check_sums)) == 0) {
-            // Replace with the provided value
-            delete cv; // free up old one
-            cv =  new_value;
-            // printf("WARNING: duplicate config line replaced\n");
-            return;
+    for(Chunk *chunk = first; chunk != NULL; chunk = chunk->next) {
+        for(uint8_t i = 0; i < chunk->used; i++) {
+            if(memcmp(new_value.check_sums, chunk->values[i].check_sums,
+                      sizeof(chunk->values[i].check_sums)) == 0) {
+                chunk->values[i] = new_value;
+                return &chunk->values[i];
+            }
         }
     }
 
-    // Value does not already exists, add to the list
-    store.push_back(new_value);
+    if(last == NULL || last->used == VALUES_PER_CHUNK) {
+        Chunk *chunk = new(std::nothrow) Chunk;
+        if(chunk == NULL) {
+            THEKERNEL->streams->printf("ERROR: out of memory growing config cache\n");
+            THEKERNEL->set_config_load_error(true);
+            return NULL;
+        }
+        if(last == NULL) first = chunk;
+        else last->next = chunk;
+        last = chunk;
+    }
+
+    ConfigValue *value = &last->values[last->used++];
+    *value = new_value;
+    count++;
+    return value;
 }
 
-ConfigValue *ConfigCache::lookup(const uint16_t *check_sums) const
+ConfigValue *ConfigCache::lookup(const uint16_t *check_sums)
 {
-    for( auto &cv : store) {
-        if(memcmp(check_sums, cv->check_sums, sizeof(cv->check_sums)) == 0)
-            return cv;
+    for(Chunk *chunk = first; chunk != NULL; chunk = chunk->next) {
+        for(uint8_t i = 0; i < chunk->used; i++) {
+            if(memcmp(check_sums, chunk->values[i].check_sums,
+                      sizeof(chunk->values[i].check_sums)) == 0)
+                return &chunk->values[i];
+        }
     }
 
     return NULL;
@@ -64,20 +96,24 @@ ConfigValue *ConfigCache::lookup(const uint16_t *check_sums) const
 
 void ConfigCache::collect(uint16_t family, uint16_t cs, vector<uint16_t> *list)
 {
-    for( auto &kv : store ) {
-        if( kv->check_sums[2] == cs && kv->check_sums[0] == family ) {
-            // We found a module enable for this family, add it's number
-            list->push_back(kv->check_sums[1]);
+    for(Chunk *chunk = first; chunk != NULL; chunk = chunk->next) {
+        for(uint8_t i = 0; i < chunk->used; i++) {
+            ConfigValue &value = chunk->values[i];
+            if(value.check_sums[2] == cs && value.check_sums[0] == family)
+                list->push_back(value.check_sums[1]);
         }
     }
 }
 
 void ConfigCache::dump(StreamOutput *stream)
 {
-    int l = 1;
-    for( auto &kv : store ) {
-        ConfigValue *v = kv;
-        stream->printf("%3d - %04X %04X %04X : '%s' - found: %d, default: %d, default-double: %f, default-int: %d\n",
-                       l++, v->check_sums[0], v->check_sums[1], v->check_sums[2], v->value.c_str(), v->found, v->default_set, v->default_double, v->default_int );
+    unsigned index = 0;
+    for(Chunk *chunk = first; chunk != NULL; chunk = chunk->next) {
+        for(uint8_t i = 0; i < chunk->used; i++) {
+            ConfigValue &value = chunk->values[i];
+            stream->printf("%3u - %04X %04X %04X : '%s'\n", ++index,
+                           value.check_sums[0], value.check_sums[1],
+                           value.check_sums[2], value.value);
+        }
     }
 }

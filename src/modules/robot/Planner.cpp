@@ -39,12 +39,17 @@ Planner::Planner()
     config_load();
 }
 
+void Planner::reset_after_abort()
+{
+    memset(previous_unit_vec, 0, sizeof(previous_unit_vec));
+}
+
 // Configure acceleration
 void Planner::config_load()
 {
-    this->junction_deviation = THEKERNEL->config->value(junction_deviation_checksum)->by_default(0.05F)->as_number();
-    this->z_junction_deviation = THEKERNEL->config->value(z_junction_deviation_checksum)->by_default(NAN)->as_number(); // disabled by default
-    this->minimum_planner_speed = THEKERNEL->config->value(minimum_planner_speed_checksum)->by_default(0.0f)->as_number();
+    this->junction_deviation = THEKERNEL->config->value(junction_deviation_checksum)->as_number(0.05F);
+    this->z_junction_deviation = THEKERNEL->config->value(z_junction_deviation_checksum)->as_number(NAN); // disabled by default
+    this->minimum_planner_speed = THEKERNEL->config->value(minimum_planner_speed_checksum)->as_number(0.0f);
 }
 
 
@@ -53,6 +58,8 @@ void Planner::config_load()
 bool Planner::append_block( ActuatorCoordinates &actuator_pos, uint8_t n_motors, float rate_mm_s, float distance, float *unit_vec, float acceleration, float s_value, bool g123, unsigned int _line)
 // bool Planner::append_block( ActuatorCoordinates &actuator_pos, uint8_t n_motors, float rate_mm_s, float distance, float *unit_vec, float acceleration, float *s_values, int s_count, bool g123, unsigned int _line)
 {
+    if (THECONVEYOR->motion_abort_requested()) return false;
+
     // Create ( recycle ) a new block
     Block* block = THECONVEYOR->queue.head_ref();
     block->line = _line;
@@ -68,9 +75,11 @@ bool Planner::append_block( ActuatorCoordinates &actuator_pos, uint8_t n_motors,
 
     for (size_t i = 0; i < n_motors; i++) {
         int32_t steps = THEROBOT->actuators[i]->steps_to_target(actuator_pos[i]);
-        // Update current position
+        // Keep last_milestone mm in sync with the commanded position even when
+        // this axis takes no steps. Step counts still only advance when steps
+        // != 0, so a later move can still accumulate into a full step.
+        THEROBOT->actuators[i]->update_last_milestones(actuator_pos[i], steps);
         if(steps != 0) {
-            THEROBOT->actuators[i]->update_last_milestones(actuator_pos[i], steps);
             has_steps = true;
         }
 
@@ -233,9 +242,7 @@ bool Planner::append_block( ActuatorCoordinates &actuator_pos, uint8_t n_motors,
     // The block can now be used
     block->ready();
 
-    THECONVEYOR->queue_head_block();
-
-    return true;
+    return THECONVEYOR->queue_head_block();
 }
 
 void Planner::recalculate()
@@ -333,5 +340,4 @@ float Planner::max_allowable_speed(float acceleration, float target_velocity, fl
     // Was acceleration*60*60*distance, in case this breaks, but here we prefer to use seconds instead of minutes
     return(sqrtf(target_velocity * target_velocity - 2.0F * acceleration * distance));
 }
-
 

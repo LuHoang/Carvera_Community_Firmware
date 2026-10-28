@@ -6,6 +6,7 @@
 */
 
 #include "libs/Kernel.h"
+#include "libs/FirmwareFileSystem.h"
 #include "libs/utils.h"
 #include "system_LPC17xx.h"
 #include "LPC17xx.h"
@@ -22,7 +23,7 @@ using std::string;
 
 uint16_t get_checksum(const string &to_check)
 {
-    return get_checksum(to_check.c_str());
+    return get_checksum(std::string_view(to_check));
 }
 
 uint16_t get_checksum(const char *to_check)
@@ -39,7 +40,24 @@ uint16_t get_checksum(const char *to_check)
     return (sum2 << 8) | sum1;
 }
 
+uint16_t get_checksum(std::string_view to_check)
+{
+    // From: http://en.wikipedia.org/wiki/Fletcher%27s_checksum
+    uint16_t sum1 = 0;
+    uint16_t sum2 = 0;
+    for(char c : to_check) {
+        sum1 = (sum1 + c) % 255;
+        sum2 = (sum2 + sum1) % 255;
+    }
+    return (sum2 << 8) | sum1;
+}
+
 void get_checksums(uint16_t check_sums[], const string &key)
+{
+    get_checksums(check_sums, std::string_view(key));
+}
+
+void get_checksums(uint16_t check_sums[], std::string_view key)
 {
     check_sums[0] = 0x0000;
     check_sums[1] = 0x0000;
@@ -47,16 +65,13 @@ void get_checksums(uint16_t check_sums[], const string &key)
     size_t begin_key = 0;
     unsigned int counter = 0;
     while( begin_key < key.size() && counter < 3 ) {
-        size_t end_key =  key.find_first_of(".", begin_key);
-        string key_node;
-        if(end_key == string::npos) {
-            key_node = key.substr(begin_key);
-        } else {
-            key_node = key.substr(begin_key, end_key - begin_key);
-        }
+        size_t end_key = key.find('.', begin_key);
+        std::string_view key_node = end_key == std::string_view::npos
+            ? key.substr(begin_key)
+            : key.substr(begin_key, end_key - begin_key);
 
         check_sums[counter] = get_checksum(key_node);
-        if(end_key == string::npos) break;
+        if(end_key == std::string_view::npos) break;
         begin_key = end_key + 1;
         counter++;
     }
@@ -153,7 +168,7 @@ string shift_parameter( string &parameters )
             }
             
             // Decode special characters
-            for (int i = 0; i < result.length(); i ++) {
+            for (unsigned int i = 0; i < result.length(); i ++) {
             	if (result[i] == 0x01) {
             		result[i] = ' ';
             	} else if (result[i] == 0x02) {
@@ -178,7 +193,7 @@ string shift_parameter( string &parameters )
     if ( beginning == string::npos ) {
         string temp = parameters;
         parameters = "";
-        for (int i = 0; i < temp.length(); i ++) {
+        for (unsigned int i = 0; i < temp.length(); i ++) {
         	if (temp[i] == 0x01) {
         		temp[i] = ' ';
         	} else if (temp[i] == 0x02) {
@@ -195,7 +210,7 @@ string shift_parameter( string &parameters )
     }
     string temp = parameters.substr( 0, beginning );
     parameters = parameters.substr(beginning + 1, parameters.size());
-    for (int i = 0; i < temp.length(); i ++) {
+    for (unsigned int i = 0; i < temp.length(); i ++) {
     	if (temp[i] == 0x01) {
     		temp[i] = ' ';
     	} else if (temp[i] == 0x02) {
@@ -224,13 +239,12 @@ string get_arguments( const string& possible_command )
 // Returns true if the file exists
 bool file_exists( const string file_name )
 {
-    bool exists = false;
-    FILE *lp = fopen(file_name.c_str(), "r");
-    if(lp) {
-        exists = true;
+    FILE *lp = fwfs::fopen(file_name.c_str(), "r");
+    if (lp == NULL) {
+        return false;
     }
-    fclose(lp);
-    return exists;
+    fwfs::fclose(lp);
+    return true;
 }
 
 // Prepares and executes a watchdog reset for dfu or reboot
@@ -280,26 +294,43 @@ std::string absolute_from_relative( std::string path )
     return cwd + '/' + path;
 }
 
+// Name stored under /sd/gcodes/.md5 or .lz for a data file.
+// Paths under gcodes/ keep the relative path (including subdirs). Other
+// files use the basename, e.g. /sd/config.default -> config.default.
+static string sidecar_relative_name(const string& origin)
+{
+	static const char gcodes[] = "gcodes/";
+	const size_t gcodes_len = sizeof(gcodes) - 1;
+	size_t found = origin.find(gcodes);
+	if (found != string::npos) {
+		return origin.substr(found + gcodes_len);
+	}
+	size_t slash = origin.find_last_of('/');
+	if (slash != string::npos) {
+		return origin.substr(slash + 1);
+	}
+	return origin;
+}
+
 // Change from origin path to sub path
 std::string change_to_md5_path( std::string origin )
 {
-	unsigned found = origin.find("gcodes/");
-	string filename = origin.substr(found + 7);
+	string filename = sidecar_relative_name(origin);
 	string path = "/sd/gcodes";
-	DIR * d = opendir(path.c_str());
+	DIR * d = fwfs::opendir(path.c_str());
 	if(NULL == d )
 	{
-		mkdir(path.c_str(), 0);
+		fwfs::mkdir(path.c_str(), 0);
 	}
 	else
 	{
 		closedir(d);	
 	}
 	path = "/sd/gcodes/.md5";
-	d = opendir(path.c_str());
+	d = fwfs::opendir(path.c_str());
 	if(NULL == d )
 	{
-		mkdir(path.c_str(), 0);
+		fwfs::mkdir(path.c_str(), 0);
 	}
 	else
 	{
@@ -312,13 +343,12 @@ std::string change_to_md5_path( std::string origin )
 // Change from origin path to quicklz file sub path
 std::string change_to_lz_path( std::string origin )
 {
-	unsigned found = origin.find("gcodes/");
-	string filename = origin.substr(found + 7);	
+	string filename = sidecar_relative_name(origin);
 	string path = "/sd/gcodes/.lz";
-	DIR * d = opendir(path.c_str());
+	DIR * d = fwfs::opendir(path.c_str());
 	if(NULL == d )
 	{
-		mkdir(path.c_str(), 0);
+		fwfs::mkdir(path.c_str(), 0);
 	}
 	else
 	{
@@ -335,13 +365,13 @@ void check_and_make_path( std::string origin )
 {
 	size_t pos = 0;
     std::string dir;
-    int res;
-    int ret = 0;
+    //int res;
+    //int ret = 0;
 
     while ((pos = origin.find_first_of('/', pos)) != std::string::npos) {
         dir = origin.substr(0, pos++);
         if (dir.empty()) continue;  // Skip leading '/'
-        mkdir(dir.c_str(),0);
+        fwfs::mkdir(dir.c_str(),0);
     }
 }
 
@@ -446,3 +476,9 @@ void ltrim(std::string& s, const char* t)
     s.erase(0, s.find_first_not_of(t));
 }
 
+// Advance a C-string pointer past any leading whitespace, return the new position
+const char* ltrim_cstr(const char* s)
+{
+    while (*s && isspace((unsigned char)*s)) s++;
+    return s;
+}

@@ -48,31 +48,46 @@ WRITE_BUFFER_DISABLE ?= 0
 STACK_SIZE ?= 0
 
 
-# Configure MRI variables based on BUILD_TYPE build type variable.
+# Configure MRI variables based on BUILD_TYPE variable.
+#   Release - Production firmware. Optimized for size (-Os), no MRI debug monitor.
+#   Debug   - Development firmware. Optimized for debugging (-Og), MRI debug monitor
+#             linked. Allows GDB attach via serial and __debugbreak() calls.
+#             Uses -Og (not -O0) because unoptimized code overflows flash on LPC1768.
 ifeq "$(BUILD_TYPE)" "Release"
-OPTIMIZATION ?= 2
+OPTIMIZATION ?= s
 MRI_ENABLE = 0
 MRI_SEMIHOST_STDIO ?= 0
 endif
 
-
 ifeq "$(BUILD_TYPE)" "Debug"
-OPTIMIZATION = 0
-MRI_ENABLE ?= 1
-MRI_SEMIHOST_STDIO ?= 1
-endif
-
-
-ifeq "$(BUILD_TYPE)" "Checked"
-OPTIMIZATION ?= s
+OPTIMIZATION ?= g
 MRI_ENABLE = 1
 MRI_SEMIHOST_STDIO ?= 1
 endif
 
 MRI_INIT_PARAMETERS=$(MRI_UART)
 
-# Output Object Directory
-OUTDIR=../$(DEVICE)
+# Select the machine family at build time. Keep the existing Carvera output
+# directory as the default so current build and packaging paths remain valid.
+MACHINE ?= carvera
+ifeq "$(MACHINE)" "carvera"
+OUTDIR = ../$(DEVICE)
+DEFINES += -DMACHINE_FAMILY_CARVERA
+else ifeq "$(MACHINE)" "z1"
+OUTDIR = ../$(DEVICE)-z1
+DEFINES += -DMACHINE_FAMILY_Z1
+REMOTE_SETTINGS_TRANSFER := 1
+STREAMED_JOB_PLAYBACK := 1
+CANOPEN_SUPPORT := 1
+SERIAL_RX_DMA := 1
+NO_USB_HOST := 1
+NO_VESC_SPINDLE := 1
+NO_SD_CARD := 1
+NO_WIRELESS_PROBE := 1
+NO_WIFI_PROVIDER := 1
+else
+$(error Unsupported MACHINE '$(MACHINE)'; expected carvera or z1)
+endif
 
 # List of sources to be compiled/assembled
 CSRCS1 = $(wildcard $(SRC)/*.c $(SRC)/*/*.c $(SRC)/*/*/*.c $(SRC)/*/*/*/*.c $(SRC)/*/*/*/*/*.c $(SRC)/*/*/*/*/*/*.c)
@@ -97,6 +112,33 @@ ASRCS +=  $(wildcard $(SRC)/*.s $(SRC)/*/*.s $(SRC)/*/*/*.s $(SRC)/*/*/*/*.s $(S
 endif
 
 CPPSRCS1 = $(wildcard $(SRC)/*.cpp $(SRC)/*/*.cpp $(SRC)/*/*/*.cpp $(SRC)/*/*/*/*.cpp $(SRC)/*/*/*/*/*.cpp $(SRC)/*/*/*/*/*/*.cpp)
+ifeq "$(SERIAL_RX_DMA)" "1"
+DEFINES += -DSERIAL_RX_DMA
+else
+CPPSRCS1 := $(filter-out $(SRC)/modules/communication/UartRxDma.cpp,$(CPPSRCS1))
+endif
+ifeq "$(REMOTE_SETTINGS_TRANSFER)" "1"
+DEFINES += -DREMOTE_SETTINGS_TRANSFER
+else
+CPPSRCS1 := $(filter-out \
+	$(SRC)/libs/ConfigSources/RemoteConfigSource.cpp \
+	$(SRC)/modules/communication/RemoteTransfer.cpp \
+,$(CPPSRCS1))
+endif
+ifeq "$(NO_SD_CARD)" "1"
+DEFINES += -DNO_SD_CARD
+endif
+ifeq "$(STREAMED_JOB_PLAYBACK)" "1"
+DEFINES += -DSTREAMED_JOB_PLAYBACK
+endif
+ifeq "$(CANOPEN_SUPPORT)" "1"
+DEFINES += -DCANOPEN_SUPPORT
+else
+CPPSRCS1 := $(filter-out \
+	$(SRC)/modules/tools/canopen/CANBus.cpp \
+	$(SRC)/modules/tools/canopen/% \
+,$(CPPSRCS1))
+endif
 ifeq "$(NONETWORK)" "1"
 	CPPSRCS2 = $(filter-out $(SRC)/libs/Network/%,$(CPPSRCS1))
 else
@@ -123,6 +165,88 @@ EXL = $(patsubst %,$(SRC)/modules/%/%,$(EXCLUDED_MODULES))
 CPPSRCS3 = $(filter-out $(EXL),$(CPPSRCS21))
 DEFINES += $(call uc, $(subst /,_,$(patsubst %,-DNO_%,$(EXCLUDED_MODULES))))
 
+# CARTESIAN_ONLY: exclude all non-Cartesian arm solutions
+ifdef CARTESIAN_ONLY
+CPPSRCS3 := $(filter-out \
+  $(SRC)/modules/robot/arm_solutions/HBotSolution.cpp \
+  $(SRC)/modules/robot/arm_solutions/CoreXZSolution.cpp \
+  $(SRC)/modules/robot/arm_solutions/LinearDeltaSolution.cpp \
+  $(SRC)/modules/robot/arm_solutions/ExperimentalDeltaSolution.cpp \
+  $(SRC)/modules/robot/arm_solutions/RotaryDeltaSolution.cpp \
+  $(SRC)/modules/robot/arm_solutions/MorganSCARASolution.cpp \
+  $(SRC)/modules/robot/arm_solutions/RotatableCartesianSolution.cpp \
+  ,$(CPPSRCS3))
+DEFINES += -DCARTESIAN_ONLY
+endif
+
+# CARTGRID_ONLY: exclude delta/three-point leveling strategies
+ifdef CARTGRID_ONLY
+CPPSRCS3 := $(filter-out \
+  $(SRC)/modules/tools/zprobe/DeltaGridStrategy.cpp \
+  $(SRC)/modules/tools/zprobe/DeltaCalibrationStrategy.cpp \
+  $(SRC)/modules/tools/zprobe/ThreePointStrategy.cpp \
+  ,$(CPPSRCS3))
+DEFINES += -DCARTGRID_ONLY
+endif
+
+# NO_MODBUS_SPINDLE: exclude modbus/huanyang spindle types and SoftSerial library
+ifdef NO_MODBUS_SPINDLE
+CPPSRCS3 := $(filter-out \
+  $(SRC)/modules/tools/spindle/HuanyangSpindleControl.cpp \
+  $(SRC)/modules/tools/spindle/ModbusSpindleControl.cpp \
+  $(SRC)/modules/tools/spindle/Modbus/Modbus.cpp \
+  $(SRC)/modules/tools/spindle/SoftSerial/BufferedSoftSerial.cpp \
+  $(SRC)/modules/tools/spindle/SoftSerial/SoftSerial.cpp \
+  $(SRC)/modules/tools/spindle/SoftSerial/SoftSerial_rx.cpp \
+  $(SRC)/modules/tools/spindle/SoftSerial/SoftSerial_tx.cpp \
+  ,$(CPPSRCS3))
+DEFINES += -DNO_MODBUS_SPINDLE
+endif
+
+# NO_VESC_SPINDLE: exclude VESC USB spindle driver
+ifdef NO_USB_HOST
+NO_VESC_SPINDLE := 1
+endif
+
+ifdef NO_VESC_SPINDLE
+CPPSRCS3 := $(filter-out \
+  $(SRC)/modules/tools/spindle/VESCSpindleControl.cpp \
+  ,$(CPPSRCS3))
+DEFINES += -DNO_VESC_SPINDLE
+endif
+
+ifdef NO_USB_HOST
+CPPSRCS3 := $(filter-out \
+  $(SRC)/libs/USBDevice/MSCFileSystem.cpp \
+  $(SRC)/libs/USBDevice/USBHostCDC.cpp \
+  $(SRC)/libs/USBDevice/USBHostLite/usbhost_lpc17xx.cpp \
+  $(SRC)/libs/USBDevice/USBHostLite/usbhost_ms.cpp \
+  ,$(CPPSRCS3))
+DEFINES += -DNO_USB_HOST
+endif
+
+ifdef NO_WIRELESS_PROBE
+CPPSRCS3 := $(filter-out \
+  $(SRC)/modules/communication/SerialConsole2.cpp \
+  ,$(CPPSRCS3))
+DEFINES += -DNO_WIRELESS_PROBE
+endif
+
+ifdef NO_WIFI_PROVIDER
+CPPSRCS3 := $(filter-out \
+  $(SRC)/modules/utils/wifi/WifiProvider.cpp \
+  ,$(CPPSRCS3))
+DEFINES += -DNO_WIFI_PROVIDER
+endif
+
+# NO_PID_AUTOTUNE: exclude PID autotuner (not needed when no heaters are connected)
+ifdef NO_PID_AUTOTUNE
+CPPSRCS3 := $(filter-out \
+  $(SRC)/modules/tools/temperaturecontrol/PID_Autotuner.cpp \
+  ,$(CPPSRCS3))
+DEFINES += -DNO_PID_AUTOTUNE
+endif
+
 # do not compile the src/testframework as that can only be done with rake
 CPPSRCS = $(filter-out $(SRC)/testframework/%,$(CPPSRCS3))
 
@@ -132,9 +256,13 @@ OBJECTS = $(patsubst %.c,$(OUTDIR)/%.o,$(CSRCS)) $(patsubst %.s,$(OUTDIR)/%.o,$(
 # Add in the MBED customization stubs which allow hooking in the MRI debug monitor.
 OBJECTS += $(OUTDIR)/mbed_custom.o
 
+ifeq "$(MACHINE)" "carvera"
 OBJECTS += $(OUTDIR)/configdefault.o
-
 OBJECTS += $(OUTDIR)/config2default.o
+else
+OBJECTS += $(OUTDIR)/config_z1default.o
+OBJECTS += $(OUTDIR)/config_z1prodefault.o
+endif
 
 # List of the header dependency files, one per object file.
 DEPFILES = $(patsubst %.o,%.d,$(OBJECTS))
@@ -193,6 +321,7 @@ endif
 # Compiler Options
 GCFLAGS += -O$(OPTIMIZATION) -g3 $(DEVICE_CFLAGS)
 GCFLAGS += -ffunction-sections -fdata-sections  -fno-exceptions -fno-delete-null-pointer-checks
+GCFLAGS += -flto -flto-partition=max
 GCFLAGS += $(patsubst %,-I%,$(INCDIRS))
 GCFLAGS += $(DEFINES)
 GCFLAGS += $(DEPFLAGS)
@@ -201,12 +330,11 @@ GCFLAGS += -Wall -Wextra -Wno-unused-parameter -fomit-frame-pointer \
 
 ifeq ($(IS_GCC_10_3_OR_LATER),1)
 GCFLAGS += -fanalyzer -floop-unroll-and-jam \
-	-floop-interchange -fstack-clash-protection -mfix-cortex-m3-ldrd \
- 	-ftree-vectorize
+	-floop-interchange -mfix-cortex-m3-ldrd
 endif
 
 
-GPFLAGS += $(GCFLAGS) -fno-rtti -std=gnu++11
+GPFLAGS += $(GCFLAGS) -fno-rtti -std=gnu++17
 
 AS_GCFLAGS += -g3 $(DEVICE_FLAGS) -x assembler-with-cpp
 AS_GCFLAGS += $(patsubst %,-I%,$(INCDIRS))
@@ -215,7 +343,13 @@ AS_FLAGS += -g3 $(DEVICE_FLAGS)
 
 # Linker Options.
 LDFLAGS = $(DEVICE_FLAGS) -specs=$(BUILD_DIR)/startfile.spec
-LDFLAGS += -Wl,-Map=$(OUTDIR)/$(PROJECT).map,--cref,--gc-sections,--wrap=_isatty,--wrap=malloc,--wrap=realloc,--wrap=free$(MRI_WRAPS)
+ifeq "$(OS)" "Windows_NT"
+LDFLAGS += -flto
+else
+LDFLAGS += -flto=auto
+endif
+LDFLAGS += -flto-partition=max -Wl,-Map=$(OUTDIR)/$(PROJECT).map,--cref,--gc-sections,--wrap=_isatty,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free,--wrap=_malloc_r,--wrap=_calloc_r,--wrap=_realloc_r,--wrap=_free_r$(MRI_WRAPS)
+
 LDFLAGS += -T$(LSCRIPT)  -L $(EXTERNAL_DIR)/gcc/LPC1768
 #LDFLAGS += -L $(BUILD_DIR) -lM8266WIFI
 ifneq "$(NO_FLOAT_SCANF)" "1"
@@ -335,10 +469,35 @@ $(OUTDIR)/%.o : %.s makefile
 	$(Q) $(MKDIR) $(call convert-slash,$(dir $@)) $(QUIET)
 	$(Q) $(AS) $(AS_FLAGS) -o $@ $<
 
-$(OUTDIR)/configdefault.o : config.default
-	$(Q) $(OBJCOPY) -I binary -O elf32-littlearm -B arm --readonly-text --rename-section .data=.rodata.configdefault $< $@
+# Minify config files before embedding to save flash space.
+# The minifier strips comments, blank lines, and excess whitespace.
+# We write the minified file with the same basename so objcopy generates
+# the expected symbols (_binary_config_default_start/end, etc.).
+# Select the appropriate minify script for the current OS.
+ifeq "$(OS)" "Windows_NT"
+MINIFY = powershell -ExecutionPolicy Bypass -File $(BUILD_DIR)/minify-config.ps1
+else
+MINIFY = $(BUILD_DIR)/minify-config.sh
+endif
 
-$(OUTDIR)/config2default.o : config2.default
-	$(Q) $(OBJCOPY) -I binary -O elf32-littlearm -B arm --readonly-text --rename-section .data=.rodata.config2default $< $@
+$(OUTDIR)/configdefault.o : config.default $(BUILD_DIR)/minify-config.sh $(BUILD_DIR)/minify-config.ps1
+	$(Q) $(MKDIR) $(call convert-slash,$(OUTDIR)/_minified) $(QUIET)
+	$(Q) $(MINIFY) $< $(OUTDIR)/_minified/config.default
+	$(Q) cd $(OUTDIR)/_minified && $(OBJCOPY) -I binary -O elf32-littlearm -B arm --readonly-text --rename-section .data=.rodata.configdefault config.default ../configdefault.o
+
+$(OUTDIR)/config2default.o : config2.default $(BUILD_DIR)/minify-config.sh $(BUILD_DIR)/minify-config.ps1
+	$(Q) $(MKDIR) $(call convert-slash,$(OUTDIR)/_minified) $(QUIET)
+	$(Q) $(MINIFY) $< $(OUTDIR)/_minified/config2.default
+	$(Q) cd $(OUTDIR)/_minified && $(OBJCOPY) -I binary -O elf32-littlearm -B arm --readonly-text --rename-section .data=.rodata.config2default config2.default ../config2default.o
+
+$(OUTDIR)/config_z1default.o : config_z1.default $(BUILD_DIR)/minify-config.sh $(BUILD_DIR)/minify-config.ps1
+	$(Q) $(MKDIR) $(call convert-slash,$(OUTDIR)/_minified) $(QUIET)
+	$(Q) $(MINIFY) $< $(OUTDIR)/_minified/config_z1.default
+	$(Q) cd $(OUTDIR)/_minified && $(OBJCOPY) -I binary -O elf32-littlearm -B arm --readonly-text --rename-section .data=.rodata.config_z1default config_z1.default ../config_z1default.o
+
+$(OUTDIR)/config_z1prodefault.o : config_z1pro.default $(BUILD_DIR)/minify-config.sh $(BUILD_DIR)/minify-config.ps1
+	$(Q) $(MKDIR) $(call convert-slash,$(OUTDIR)/_minified) $(QUIET)
+	$(Q) $(MINIFY) $< $(OUTDIR)/_minified/config_z1pro.default
+	$(Q) cd $(OUTDIR)/_minified && $(OBJCOPY) -I binary -O elf32-littlearm -B arm --readonly-text --rename-section .data=.rodata.config_z1prodefault config_z1pro.default ../config_z1prodefault.o
 
 #########################################################################

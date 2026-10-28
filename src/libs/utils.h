@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "time.h"
 
@@ -20,9 +21,11 @@ std::vector<uint32_t> parse_number_list(const char *str, uint8_t radix);
 std::string remove_non_number( std::string str );
 
 uint16_t get_checksum(const std::string& to_check);
+uint16_t get_checksum(std::string_view to_check);
 uint16_t get_checksum(const char* to_check);
 
 void get_checksums(uint16_t check_sums[], const std::string& key);
+void get_checksums(uint16_t check_sums[], std::string_view key);
 
 std::string shift_parameter( std::string &parameters );
 
@@ -47,6 +50,7 @@ void safe_delay_ms(uint32_t delay);
 struct tm *get_fftime(unsigned short t_date, unsigned short t_time, struct tm *timeinfo);
 
 void ltrim(std::string& s, const char* t = " \t\n\r\f\v");
+const char* ltrim_cstr(const char* s);
 
 
 //#define dd(...) LPC_GPIO2->FIODIR = 0xffff; LPC_GPIO2->FIOCLR = 0xffff; LPC_GPIO2->FIOSET = __VA_ARGS__

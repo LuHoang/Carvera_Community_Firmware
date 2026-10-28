@@ -8,10 +8,28 @@
 #ifndef CONFIGSOURCE_H
 #define CONFIGSOURCE_H
 
+#include <cstdint>
 #include <string>
+#include <string_view>
 
 class ConfigValue;
 class ConfigCache;
+
+class ConfigLine {
+    public:
+        enum class Result : uint8_t { ignored, parsed, missing_pair, missing_value };
+
+        explicit ConfigLine(std::string_view line);
+
+        Result result() const { return result_; }
+        std::string_view key() const { return key_; }
+        std::string_view value() const { return value_; }
+
+    private:
+        Result result_;
+        std::string_view key_;
+        std::string_view value_;
+};
 
 class ConfigSource {
     public:
@@ -23,14 +41,15 @@ class ConfigSource {
         virtual bool is_named( uint16_t check_sum ) = 0;
         virtual bool write( std::string setting, std::string value ) = 0;
         virtual std::string read( uint16_t check_sums[3] ) = 0;
+        virtual bool remove( std::string setting ) { return false; }
 
     protected:
-        virtual ConfigValue* process_line_from_ascii_config(const std::string& line, ConfigCache* cache);
-        virtual std::string process_line_from_ascii_config(const std::string& line, uint16_t line_checksums[3]);
+        ConfigValue* process_line_from_ascii_config(const std::string& line, ConfigCache* cache);
+        std::string process_line_from_ascii_config(const std::string& line, uint16_t line_checksums[3]);
         uint16_t name_checksum;
 
     private:
-        ConfigValue* process_line(const std::string &buffer);
+        bool process_line(const std::string &buffer, ConfigValue &result);
 };
 
 

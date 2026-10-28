@@ -9,10 +9,13 @@
 #pragma once
 
 #include "Module.h"
+#include "PlayerLineSources.h"
+#if !defined(STREAMED_JOB_PLAYBACK)
+#include "OCodeHandler.h"
+#endif
 
 #include <stdio.h>
 #include <string>
-#include <map>
 #include <vector>
 #include <queue>
 #include <cstdint>
@@ -20,6 +23,7 @@
 using std::string;
 
 class StreamOutput;
+struct player_link_packet;
 
 class Player : public Module {
     public:
@@ -29,42 +33,69 @@ class Player : public Module {
         void on_console_line_received( void* argument );
         void on_main_loop( void* argument );
         void on_second_tick(void* argument);
-        void select_file(string argument);
+#if !defined(STREAMED_JOB_PLAYBACK)
+        void select_file(string argument, bool force_prescan = false);
         void goto_line_number(unsigned long line_number);
         void play_opened_file();
         void end_of_file();
+#endif
         void on_get_public_data(void* argument);
         void on_set_public_data(void* argument);
         void on_gcode_received(void *argument);
         void on_halt(void *argument);
 
     private:
+#if !defined(STREAMED_JOB_PLAYBACK)
+        bool prepare_ocode_prescan(StreamOutput* stream, const char* fail_msg);
+        void set_current_file(FILE* file);
+#endif
+        void close_line_source();
         void play_command( string parameters, StreamOutput* stream );
         void progress_command( string parameters, StreamOutput* stream );
         void abort_command( string parameters, StreamOutput* stream );
         void suspend_command( string parameters, StreamOutput* stream , bool pause_outside_play_mode = false);
         void resume_command( string parameters, StreamOutput* stream );
+        void save_and_stop_spindle_on_suspend();
+        void restore_spindle_on_resume();
+        void clear_saved_spindle();
+        void save_last_progress(unsigned int unknown_size_percent = 0);
+        void dispatch_gcode(const char *gcode_line);
         void goto_command( string parameters, StreamOutput* stream );
         void buffer_command( string parameters, StreamOutput* stream );
+        void request_job_abort();
+        void finish_job_abort();
+#if !defined(STREAMED_JOB_PLAYBACK)
         void upload_command( string parameters, StreamOutput* stream );
         void download_command( string parameters, StreamOutput* stream );
-        
         void test_command(string parameters, StreamOutput* stream );
+#endif
+
+        void sync_progress_max();
+#if defined(STREAMED_JOB_PLAYBACK)
+        void start_streamed_playback(StreamOutput* stream, const string& options);
+        void handle_link_packet(const player_link_packet& packet);
+        void request_streamed_lines();
+        void maintain_streamed_source();
+        bool streamed_session_active() const;
+        void reset_streamed_playback();
+#endif
         
         string extract_options(string& args);
 
+#if !defined(STREAMED_JOB_PLAYBACK)
         void set_serial_rx_irq(bool enable);
         int inbyte(StreamOutput *stream, unsigned int timeout_ms);
         int inbytes(StreamOutput *stream, char **buf, int size, unsigned int timeout_ms);
         void flush_input(StreamOutput *stream);
         void cancel_transfer(StreamOutput *stream);
-        unsigned int crc16_ccitt(unsigned char *data, unsigned int len);
         int check_crc(int crc, unsigned char *data, unsigned int len);
-		
-		int decompress(string sfilename, string dfilename, uint32_t sfilesize, StreamOutput* stream);
-//		int compressfile(string sfilename, string dfilename, StreamOutput* stream);
+        int decompress(string sfilename, string dfilename, uint32_t sfilesize, StreamOutput* stream);
+#endif
         // 2024
         // bool check_cluster(const char *gcode_str, float *x_value, float *y_value, float *distance, float *slope, float *s_value);
+#if !defined(STREAMED_JOB_PLAYBACK)
+        void SendMessage(char cmd, char* s, int size , StreamOutput *stream);
+#endif
 
         string filename;
         string last_filename;
@@ -74,27 +105,64 @@ class Player : public Module {
         StreamOutput* current_stream;
         StreamOutput* reply_stream;
 
+#if !defined(STREAMED_JOB_PLAYBACK)
         char md5_str[64];
+#endif
 
         std::queue<string> buffered_queue;
         void clear_buffered_queue();
 
+#if !defined(STREAMED_JOB_PLAYBACK)
         using macro_file_queue_item= std::tuple<std::string, unsigned long>; // allows running macros. This forms a stact filepath, line number, to return to when the internal file is complete
         std::queue<macro_file_queue_item> macro_file_queue;
         void clear_macro_file_queue();
+        OCodeHandler ocode_handler;
+#endif
 
-        FILE* current_file_handler;
+#if defined(STREAMED_JOB_PLAYBACK)
+        enum class StreamedState : uint8_t {
+            idle,
+            opening,
+            playing,
+            seeking,
+        };
+
+        StreamedJobBuffer line_source;
+        StreamedState streamed_state;
+        uint16_t filename_crc;
+        uint32_t last_request_line;
+        uint32_t streamed_last_request_us;
+        uint32_t streamed_wait_started_us;
+        bool play_data_resend_pending;
+#else
+        FileLineSource line_source;
+#endif
         // FILE* temp_file_handler;
         long file_size;
         unsigned long played_cnt;
         unsigned long elapsed_secs;
         unsigned long played_lines;
+        unsigned long file_line;
         unsigned long goto_line;
         unsigned int playing_lines;
+        // last progress when playback finished or was interrupted (for status ? to keep showing |P:...)
+        bool has_last_progress;
+        unsigned long last_played_lines;
+        unsigned int last_percent_complete;
+        unsigned long last_elapsed_secs;
         uint8_t current_motion_mode;
         float saved_position[3]; // only saves XYZ
+        float saved_spindle_rpm;
+        bool saved_spindle_ccw;
+        float last_spindle_rpm;
         float slope;
-        std::map<uint16_t, float> saved_temperatures;
+        bool saved_spindle_on;
+        bool last_spindle_on;
+        bool last_spindle_ccw;
+#if !defined(STREAMED_JOB_PLAYBACK)
+        bool skip_ocodes_prescan = false;
+#endif
+
         struct {
             bool on_boot_gcode_enable:1;
             bool booted:1;
@@ -104,5 +172,6 @@ class Player : public Module {
             bool override_leave_heaters_on:1;
             bool inner_playing:1;
             bool laser_clustering:1;
+            bool spindle_suspend_restore_enable:1;
         };
 };
