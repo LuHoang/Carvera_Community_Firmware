@@ -149,6 +149,14 @@ constexpr uint32_t VESC_RESPONSE_TIMEOUT_US = 400000UL;
 constexpr uint32_t VESC_ALIVE_INTERVAL_MS = 200;
 constexpr uint32_t VESC_IDLE_POLL_INTERVAL_MS = 1000;
 constexpr uint32_t VESC_TIMEOUT_STATUS_GRACE_US = 100000UL;
+
+// A failed transfer is retried up to this many times, as long as the first
+// failure was less than VESC_COMM_ERROR_WINDOW_US ago. VESC's own command
+// timeout still stops the motor if the link is really gone.
+constexpr uint8_t VESC_MAX_COMM_RETRIES = 3;
+constexpr uint32_t VESC_COMM_ERROR_WINDOW_US = 600000UL;
+constexpr uint32_t VESC_COMM_RETRY_DELAY_US = 20000UL;
+constexpr uint8_t OHCI_CC_STALL = 4;
 }  // namespace
 
 void VESCSpindleControl::raise_spindle_alarm(const char *reason) {
@@ -162,6 +170,87 @@ void VESCSpindleControl::handle_comm_error(const char *reason) {
     comm_error_halted = true;
     raise_spindle_alarm(reason);
   }
+}
+
+namespace {
+const char *ohci_completion_code_name(const uint8_t cc) {
+  switch (cc) {
+    case 1: return "CRC";
+    case 2: return "bit stuffing";
+    case 3: return "data toggle mismatch";
+    case 4: return "stall";
+    case 5: return "device not responding";
+    case 6: return "PID check failure";
+    case 7: return "unexpected PID";
+    case 8: return "data overrun";
+    case 9: return "data underrun";
+    case 12: return "buffer overrun";
+    case 13: return "buffer underrun";
+    default: return "unknown";
+  }
+}
+}  // namespace
+
+void VESCSpindleControl::handle_transfer_error(const char *direction) {
+  char reason[128];
+  const unsigned long gap_ms = max_xfer_idle_gap_us / 1000;
+  const unsigned long ok_packets = telemetry_seq;
+  bool retryable = false;
+
+  switch (usb.last_error()) {
+    case CDC_ERR_COMPLETION_CODE: {
+      const uint8_t cc = usb.last_completion_code();
+      // A stalled endpoint needs CLEAR_FEATURE, which this driver does not do.
+      retryable = cc != OHCI_CC_STALL;
+      snprintf(reason, sizeof reason, "VESC USB %s error: OHCI CC=%u (%s), %lu telemetry OK, gap %lu ms, port changes %lu",
+               direction, cc, ohci_completion_code_name(cc), ok_packets, gap_ms,
+               static_cast<unsigned long>(usb.port_changes_since_init()));
+      break;
+    }
+    case CDC_ERR_TIMEOUT:
+      retryable = true;
+      snprintf(reason, sizeof reason, "VESC USB %s error: no completion in %lu ms, %lu telemetry packets OK, idle gap %lu ms",
+               direction, static_cast<unsigned long>(CDC_XFER_TIMEOUT_MS), ok_packets, gap_ms);
+      break;
+    case CDC_ERR_DISCONNECTED:
+      snprintf(reason, sizeof reason, "VESC USB %s error: device disconnected, %lu telemetry packets OK", direction,
+               ok_packets);
+      break;
+    default:
+      snprintf(reason, sizeof reason, "VESC USB %s error", direction);
+      break;
+  }
+  handle_recoverable_error(reason, retryable);
+}
+
+// Retries resend the packet still held in pkt_buf, after a short pause so a
+// burst of electrical noise has time to pass.
+void VESCSpindleControl::handle_recoverable_error(const char *reason, const bool retryable) {
+  const uint32_t now_us = us_ticker_read();
+  if (comm_error_count == 0) comm_error_first_us = now_us;
+  comm_error_count++;
+  rx_resync = true;
+
+  if (!retryable || comm_error_count > VESC_MAX_COMM_RETRIES ||
+      elapsed_us(comm_error_first_us, VESC_COMM_ERROR_WINDOW_US)) {
+    comm_error_count = 0;
+    comm_retry_wait = false;
+    comm_state = VESC_COMM_IDLE;
+    handle_comm_error(reason);
+    return;
+  }
+
+  THEKERNEL->streams->printf("WARNING: %s - retry %u/%u\n", reason, comm_error_count, VESC_MAX_COMM_RETRIES);
+  comm_retry_start_us = now_us;
+  comm_retry_wait = true;
+  comm_state = VESC_COMM_SEND_PENDING;
+}
+
+void VESCSpindleControl::note_round_trip_ok() {
+  if (comm_error_count == 0) return;
+  comm_errors_recovered++;
+  THEKERNEL->streams->printf("VESC USB recovered after %u error(s)\n", comm_error_count);
+  comm_error_count = 0;
 }
 
 void VESCSpindleControl::dwell_after_spindle_change() {
@@ -191,7 +280,7 @@ bool VESCSpindleControl::vesc_timeout_status_is_stale() const {
 
   // VESC timeout_reset() updates the command timestamp immediately, but the
   // reported timeout flag is cleared by VESC's timeout thread on its next pass.
-  return !elapsed_us(last_timeout_reset_cmd_time, VESC_TIMEOUT_STATUS_GRACE_US);
+  return !status_timeout_trusted;
 }
 
 void VESCSpindleControl::on_module_loaded() {
@@ -239,14 +328,18 @@ bool VESCSpindleControl::wait_for_usb_transfer(const CDCXferState active_state) 
 void VESCSpindleControl::reset_rx_packet() { rx_pkt_len = 0; }
 
 VESCRxPacketState VESCSpindleControl::append_rx_packet_bytes(const volatile uint8_t *buf, const uint32_t len) {
-  // CDC may split one VESC frame across reads, but this driver never expects
-  // unrelated bytes in the stream. Malformed framing is a communication
-  // failure, not something to resynchronise around silently.
+  // CDC may split one VESC frame across reads. Normally the stream holds only
+  // whole responses, so stray bytes are an error. After a failed transfer the
+  // VESC may still send the rest of an old response, so rx_resync skips bytes
+  // up to the next frame start and ignores bytes after a complete frame.
   for (uint32_t i = 0; i < len; i++) {
     const uint8_t b = buf[i];
 
     if (rx_pkt_len == 0) {
-      if (b != 0x02) return VESC_RX_INVALID;
+      if (b != 0x02) {
+        if (rx_resync) continue;
+        return VESC_RX_INVALID;
+      }
       rx_pkt_buf[rx_pkt_len++] = b;
       continue;
     }
@@ -261,7 +354,11 @@ VESCRxPacketState VESCSpindleControl::append_rx_packet_bytes(const volatile uint
       if (rx_pkt_len > expected_len) return VESC_RX_INVALID;
       if (rx_pkt_len == expected_len) {
         if (rx_pkt_buf[rx_pkt_len - 1] != 0x03) return VESC_RX_INVALID;
-        return (i + 1 == len) ? VESC_RX_COMPLETE : VESC_RX_INVALID;
+        if (i + 1 == len) {
+          rx_resync = false;
+          return VESC_RX_COMPLETE;
+        }
+        return rx_resync ? VESC_RX_COMPLETE : VESC_RX_INVALID;
       }
     }
   }
@@ -311,6 +408,8 @@ void VESCSpindleControl::turn_on() {
     return;
   }
 
+  timeout_resets_since_on = 0;
+  status_timeout_trusted = false;
   spindle_on = true;
   THEKERNEL->spindleon = true;
   reset_stall_monitor();
@@ -337,8 +436,10 @@ void VESCSpindleControl::set_speed(int rpm) {
 
 void VESCSpindleControl::report_speed() {
   THEKERNEL->streams->printf(
-      "VESC  State: %s  Current RPM: %5ld  Target RPM: %ld  Vin: %d V/10  Imot: %ld A/100  Tmos: %d C/10\n",
-      spindle_on ? "on" : "off", current_rpm, target_rpm, vesc_voltage, vesc_current, vesc_temp_mos);
+      "VESC  State: %s  Current RPM: %5ld  Target RPM: %ld  Vin: %d V/10  Imot: %ld A/100  Tmos: %d C/10  USB "
+      "errors recovered: %lu\n",
+      spindle_on ? "on" : "off", current_rpm, target_rpm, vesc_voltage, vesc_current, vesc_temp_mos,
+      static_cast<unsigned long>(comm_errors_recovered));
 }
 
 void VESCSpindleControl::set_factor(const float f) {
@@ -393,6 +494,9 @@ bool VESCSpindleControl::parse_get_values(const uint8_t *buf, const uint16_t len
   vesc_voltage = static_cast<int16_t>(be16(gv->v_in));
   vesc_fault_code = gv->fault_code;
   vesc_status = payload_len > VESC_GET_VALUES_STATUS_OFFSET ? payload_rx[VESC_GET_VALUES_STATUS_OFFSET] : 0;
+  status_command_gap_us = get_values_sent_time - last_timeout_reset_cmd_time;
+  status_timeout_trusted =
+      spindle_on && timeout_resets_since_on > 0 && status_command_gap_us >= VESC_TIMEOUT_STATUS_GRACE_US;
   telemetry_seq++;
   return true;
 }
@@ -446,7 +550,7 @@ void VESCSpindleControl::handle_send_wait(const CDCXferState xfer_state) {
   if (xfer_state == CDC_XFER_ERROR) {
     usb.finish();
     comm_state = VESC_COMM_IDLE;
-    handle_comm_error("VESC USB transfer error");
+    handle_transfer_error("send");
     return;
   }
 
@@ -454,6 +558,9 @@ void VESCSpindleControl::handle_send_wait(const CDCXferState xfer_state) {
 
   if (pending_cmd == COMM_SET_RPM || pending_cmd == COMM_ALIVE) {
     last_timeout_reset_cmd_time = us_ticker_read();
+    if (spindle_on) timeout_resets_since_on++;
+  } else if (pending_cmd == COMM_GET_VALUES) {
+    get_values_sent_time = us_ticker_read();
   }
   usb.finish();
 
@@ -480,8 +587,7 @@ void VESCSpindleControl::handle_recv_wait(const CDCXferState xfer_state) {
     if (rx_state == VESC_RX_COMPLETE) {
       comm_state = VESC_COMM_PROCESS;
     } else if (rx_state == VESC_RX_INVALID) {
-      comm_state = VESC_COMM_IDLE;
-      handle_comm_error("VESC invalid telemetry");
+      handle_recoverable_error("VESC invalid telemetry framing", true);
     } else if (!usb.start_recv(128)) {
       comm_state = VESC_COMM_IDLE;
       handle_comm_error("VESC USB receive start failed");
@@ -489,26 +595,34 @@ void VESCSpindleControl::handle_recv_wait(const CDCXferState xfer_state) {
   } else if (xfer_state == CDC_XFER_ERROR) {
     usb.finish();
     comm_state = VESC_COMM_IDLE;
-    handle_comm_error("VESC USB receive error");
+    handle_transfer_error("receive");
   } else if (static_cast<uint32_t>(us_ticker_read() - rx_start_time) >= VESC_RESPONSE_TIMEOUT_US) {
     usb.abort();
     usb.finish();
-    comm_state = VESC_COMM_IDLE;
-    handle_comm_error("VESC telemetry timeout");
+    handle_recoverable_error("VESC telemetry timeout", true);
   }
 }
 
 void VESCSpindleControl::process_pending_response() {
   if (pending_cmd == COMM_GET_VALUES && !parse_get_values(rx_pkt_buf, rx_pkt_len)) {
-    comm_state = VESC_COMM_IDLE;
-    handle_comm_error("VESC invalid telemetry");
+    handle_recoverable_error("VESC invalid telemetry", true);
     return;
   }
 
+  note_round_trip_ok();
   comm_state = VESC_COMM_IDLE;
 }
 
 void VESCSpindleControl::comm_poll() {
+  const uint32_t now_us = us_ticker_read();
+  if (comm_state == VESC_COMM_SEND_WAIT || comm_state == VESC_COMM_RECV_WAIT) {
+    const uint32_t gap_us = now_us - last_idle_us;
+    if (gap_us > max_xfer_idle_gap_us) max_xfer_idle_gap_us = gap_us;
+  } else {
+    max_xfer_idle_gap_us = 0;
+  }
+  last_idle_us = now_us;
+
   if (!usb.connected()) {
     handle_usb_disconnected();
     return;
@@ -521,6 +635,10 @@ void VESCSpindleControl::comm_poll() {
       schedule_next_vesc_command(us_ticker_read());
       break;
     case VESC_COMM_SEND_PENDING:
+      if (comm_retry_wait) {
+        if (!elapsed_us(comm_retry_start_us, VESC_COMM_RETRY_DELAY_US)) break;
+        comm_retry_wait = false;
+      }
       start_pending_send();
       break;
     case VESC_COMM_SEND_WAIT:
@@ -589,7 +707,9 @@ void VESCSpindleControl::on_idle(void *) {
 
   if (vesc_status & VESC_STATUS_TIMEOUT) {
     vesc_status = 0;
-    THEKERNEL->streams->printf("ERROR: VESC motor timeout - halt\n");
+    THEKERNEL->streams->printf("ERROR: VESC motor timeout - halt (last command %lu ms before request, %lu commands since start)\n",
+                               static_cast<unsigned long>(status_command_gap_us / 1000),
+                               static_cast<unsigned long>(timeout_resets_since_on));
     THEKERNEL->set_halt_reason(SPINDLE_ALARM);
     THEKERNEL->call_event(ON_HALT, nullptr);
     return;

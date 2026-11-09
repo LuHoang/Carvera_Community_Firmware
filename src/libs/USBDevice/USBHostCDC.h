@@ -24,6 +24,9 @@ constexpr uint32_t CDC_XFER_TIMEOUT_MS = 500;
 
 enum CDCXferState { CDC_XFER_IDLE = 0, CDC_XFER_SENDING, CDC_XFER_RECEIVING, CDC_XFER_COMPLETE, CDC_XFER_ERROR };
 
+// Why the last transfer ended in CDC_XFER_ERROR.
+enum CDCXferError { CDC_ERR_NONE = 0, CDC_ERR_COMPLETION_CODE, CDC_ERR_TIMEOUT, CDC_ERR_DISCONNECTED };
+
 class USBHostCDC {
  public:
   USBHostCDC();
@@ -69,6 +72,16 @@ class USBHostCDC {
 
   CDCXferState state() const { return _state; }
 
+  /** Cause of the last CDC_XFER_ERROR, and the OHCI completion code when the
+   *  cause is CDC_ERR_COMPLETION_CODE. */
+  CDCXferError last_error() const { return _error; }
+  uint8_t last_completion_code() const { return _error_cc; }
+
+  /** Root-port connect status changes since init() succeeded. A device that
+   *  resets quickly can drop and restore its connection without the host
+   *  seeing a disconnect, but it still shows up here. */
+  uint32_t port_changes_since_init() const;
+
  private:
   // Only the bytes actually fetched are safe to parse; some devices report a
   // larger wTotalLength than this firmware's shared USB buffer can hold.
@@ -82,12 +95,15 @@ class USBHostCDC {
 
   bool _connected;
   CDCXferState _state;
+  CDCXferError _error;
+  uint8_t _error_cc;
   uint8_t _cdc_iface;
   uint8_t _data_iface;
 
   uint32_t _xfer_start;
   uint32_t _xfer_max_len;
   uint32_t _rx_actual;
+  uint32_t _port_changes_at_init = 0;
 };
 
 #endif  // USBHOST_CDC_H

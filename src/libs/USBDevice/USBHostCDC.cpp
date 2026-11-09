@@ -17,6 +17,7 @@
 extern volatile USB_INT32U HOST_WdhIntr;
 extern volatile USB_INT08U HOST_TDControlStatus;
 extern volatile int gUSBConnected;
+extern volatile USB_INT32U gUSBPortChangeCount;
 extern volatile HCED *EDCtrl;
 
 namespace {
@@ -37,6 +38,8 @@ constexpr uint8_t CDC_REQUEST_TYPE_HOST_TO_INTERFACE =
 USBHostCDC::USBHostCDC()
     : _connected(false),
       _state(CDC_XFER_IDLE),
+      _error(CDC_ERR_NONE),
+      _error_cc(0),
       _cdc_iface(0),
       _data_iface(0),
       _xfer_start(0),
@@ -108,9 +111,12 @@ bool USBHostCDC::init(const uint32_t timeout_ms) {
     return false;
   }
 
+  _port_changes_at_init = gUSBPortChangeCount;
   _connected = true;
   return true;
 }
+
+uint32_t USBHostCDC::port_changes_since_init() const { return gUSBPortChangeCount - _port_changes_at_init; }
 
 USB_INT32S USBHostCDC::parse_cdc_configuration(const uint16_t fetched_len) {
   volatile USB_INT08U *desc = TDBuffer;
@@ -261,6 +267,8 @@ bool USBHostCDC::start_send(const uint8_t *data, uint32_t len) {
   for (uint32_t i = 0; i < len; i++) TDBuffer[i] = data[i];
 
   _state = CDC_XFER_SENDING;
+  _error = CDC_ERR_NONE;
+  _error_cc = 0;
   _xfer_start = us_ticker_read();
 
   submit_bulk_td(EDBulkOut, TD_OUT, TDBuffer, len);
@@ -273,6 +281,8 @@ bool USBHostCDC::start_recv(uint32_t max_len) {
   if (max_len > CDC_BULK_TRANSFER_MAX) max_len = CDC_BULK_TRANSFER_MAX;
 
   _state = CDC_XFER_RECEIVING;
+  _error = CDC_ERR_NONE;
+  _error_cc = 0;
   _xfer_max_len = max_len;
   _rx_actual = 0;
   _xfer_start = us_ticker_read();
@@ -290,6 +300,7 @@ CDCXferState USBHostCDC::poll() {
       abort_transfer();
       _connected = false;
       _state = CDC_XFER_ERROR;
+      _error = CDC_ERR_DISCONNECTED;
       return _state;
     }
 
@@ -316,6 +327,8 @@ CDCXferState USBHostCDC::poll() {
         _state = CDC_XFER_COMPLETE;
       } else {
         _state = CDC_XFER_ERROR;
+        _error = CDC_ERR_COMPLETION_CODE;
+        _error_cc = td_sts;
       }
     }
 
@@ -324,6 +337,7 @@ CDCXferState USBHostCDC::poll() {
       if (elapsed >= CDC_XFER_TIMEOUT_MS) {
         abort_transfer();
         _state = CDC_XFER_ERROR;
+        _error = CDC_ERR_TIMEOUT;
       }
     }
   }

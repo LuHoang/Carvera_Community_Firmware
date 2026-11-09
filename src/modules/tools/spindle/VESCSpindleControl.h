@@ -75,6 +75,9 @@ class VESCSpindleControl : public SpindleControl {
   bool verify_vesc_protocol();
   bool wait_for_usb_transfer(CDCXferState active_state);
   void handle_comm_error(const char *reason);
+  void handle_transfer_error(const char *direction);
+  void handle_recoverable_error(const char *reason, bool retryable);
+  void note_round_trip_ok();
   void dwell_after_spindle_change();
   int32_t commanded_rpm() const;
   void reset_stall_monitor();
@@ -119,9 +122,31 @@ class VESCSpindleControl : public SpindleControl {
   uint32_t last_poll_time = 0;
   uint32_t last_alive_time = 0;
   uint32_t last_timeout_reset_cmd_time = 0;
+  // The VESC timeout bit in a COMM_GET_VALUES reply describes the moment the
+  // request was sent, so it is judged against that time, and only once a
+  // SET_RPM or ALIVE has been sent since the spindle was turned on.
+  uint32_t get_values_sent_time = 0;
+  uint32_t timeout_resets_since_on = 0;
+  uint32_t status_command_gap_us = 0;
+  bool status_timeout_trusted = false;
   uint8_t pending_cmd = 0;
   bool speed_update_pending = false;
   uint32_t telemetry_seq = 0;
+
+  // Longest gap between on_idle calls while a USB transfer was in flight. A
+  // gap longer than the CDC transfer timeout makes a healthy VESC look dead.
+  uint32_t last_idle_us = 0;
+  uint32_t max_xfer_idle_gap_us = 0;
+
+  // Short USB glitches (for example at motor start) are retried. Only a good
+  // telemetry round trip clears the error count, so a link that can still send
+  // but never answers is not kept alive by successful keepalive sends.
+  uint8_t comm_error_count = 0;
+  uint32_t comm_error_first_us = 0;
+  uint32_t comm_retry_start_us = 0;
+  bool comm_retry_wait = false;
+  bool rx_resync = false;
+  uint32_t comm_errors_recovered = 0;
 
   // Init can fail before the normal status path is ready, so the alarm is
   // deferred to on_idle. Communication alarms are latched only until the

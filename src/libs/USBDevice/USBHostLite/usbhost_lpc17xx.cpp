@@ -33,6 +33,9 @@
 **************************************************************************************************************
 */
 volatile int gUSBConnected;
+// Counts root-port connect status changes, including a quick disconnect and
+// reconnect that leaves gUSBConnected unchanged.
+volatile USB_INT32U gUSBPortChangeCount;
 
 volatile  USB_INT32U   HOST_RhscIntr = 0;         /* Root Hub Status Change interrupt                       */
 volatile  USB_INT32U   HOST_WdhIntr  = 0;         /* Semaphore to wait until the TD is submitted            */
@@ -262,6 +265,7 @@ extern "C" void USB_IRQHandler (void)
         int_status = int_status & ie_status;
         if (int_status & OR_INTR_STATUS_RHSC) {                 /* Root hub status change interrupt     */
             if (LPC_USB->HcRhPortStatus1 & OR_RH_PORT_CSC) {
+                gUSBPortChangeCount++;
                 if (LPC_USB->HcRhStatus & OR_RH_STATUS_DRWE) {
                     /*
                      * When DRWE is on, Connect Status Change
